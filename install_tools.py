@@ -52,8 +52,6 @@ def main():
         if platform.system() != "Darwin":
             raise RuntimeError("Native tools require the native runner.")
         subprocess.run(["brew", "install", "xcodegen"], check=True)
-        install("https://github.com/MobAI-App/simslim/releases/download/v0.13.0/simslim-v0.13.0-macos-arm64.tar.gz",
-                "76807efb5beb57b73b40959eea04defe21fc18265811a495db1509b5e7be07c1", ["simslim"], directory)
     with open(os.environ["GITHUB_PATH"], "a") as output:
         output.write(str(directory) + "\n")
 
