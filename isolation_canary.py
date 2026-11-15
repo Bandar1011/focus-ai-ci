@@ -9,7 +9,7 @@ from isolation import PrivateUser
 
 
 NATIVE = r'''
-import json, os, pathlib, subprocess, time
+import json, os, pathlib, platform, subprocess, time
 root = pathlib.Path.cwd()
 developer = '/Applications/Xcode_27.0.app/Contents/Developer'
 os.environ['DEVELOPER_DIR'] = developer
@@ -27,7 +27,7 @@ try:
                '-destination','generic/platform=iOS Simulator','-derivedDataPath',str(root/'build'),
                '-jobs','2','-parallel-testing-enabled','NO','COMPILER_INDEX_STORE_ENABLE=NO',
                'CODE_SIGNING_ALLOWED=NO']
-    command += ['ARCHS='+__import__('platform').machine(), 'ONLY_ACTIVE_ARCH=YES']
+    command += ['ARCHS='+platform.machine(), 'ONLY_ACTIVE_ARCH=YES']
     run(*command, 'build-for-testing')
     run('xcrun','simctl','boot',device)
     run('xcrun','simctl','bootstatus',device,'-b')
