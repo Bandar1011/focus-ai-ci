@@ -556,7 +556,7 @@ class NativeCanaryOwnershipTests(unittest.TestCase):
                             [{'udid':'owned-device','state':state}]}})
                     raise AssertionError(command)
                 commands=[]
-                def run(command, **kwargs): commands.append(command)
+                def run(command, **kwargs): commands.append(list(command))
                 with patch.dict(os.environ), patch.object(os,'getuid',return_value=driver_uid), \
                      patch.object(os,'geteuid',return_value=driver_uid), \
                      patch.object(subprocess,'check_output',side_effect=output), \
