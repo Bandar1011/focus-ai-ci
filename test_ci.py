@@ -540,6 +540,38 @@ class EvidenceBoundaryTests(unittest.TestCase):
         self.assertEqual(original.read_text(),"keep this")
 
 
+class NativeCanaryOwnershipTests(unittest.TestCase):
+    def test_driver_and_service_must_match_the_reserved_worker_before_tests_start(self):
+        import isolation_canary
+        for driver_uid, service_uid, expected_error in ((60001,60001,None),
+                (501,60001,'Native driver UID'),(60001,501,'Worker-owned CoreSimulatorService')):
+            with self.subTest(driver_uid=driver_uid,service_uid=service_uid):
+                def output(command, **kwargs):
+                    if command[:2]==['ps','-ww']:
+                        return f'{service_uid} 123 /framework/CoreSimulatorService\n'
+                    if command[:3]==['xcrun','simctl','create']:return 'owned-device'
+                    if command[:4]==['xcrun','simctl','list','devices']:
+                        state='Shutdown' if 'available' in command else 'Booted'
+                        return json.dumps({'devices':{'com.apple.CoreSimulator.SimRuntime.iOS-27-0':
+                            [{'udid':'owned-device','state':state}]}})
+                    raise AssertionError(command)
+                commands=[]
+                def run(command, **kwargs): commands.append(command)
+                with patch.dict(os.environ), patch.object(os,'getuid',return_value=driver_uid), \
+                     patch.object(os,'geteuid',return_value=driver_uid), \
+                     patch.object(subprocess,'check_output',side_effect=output), \
+                     patch.object(subprocess,'run',side_effect=run), \
+                     patch.object(subprocess,'Popen',side_effect=AssertionError('Process sampling is not ownership proof')), \
+                     contextlib.redirect_stdout(io.StringIO()):
+                    program=compile(isolation_canary.NATIVE.replace('__EXPECTED_UID__','60001'),'native-canary','exec')
+                    if expected_error:
+                        with self.assertRaisesRegex(AssertionError,expected_error):exec(program,{})
+                    else:exec(program,{})
+                self.assertEqual(any('test-without-building' in command for command in commands),expected_error is None)
+                self.assertIn(['xcrun','simctl','shutdown','owned-device'],commands)
+                self.assertIn(['xcrun','simctl','delete','owned-device'],commands)
+
+
 class PublicToolTests(unittest.TestCase):
     def test_native_runner_installs_no_simslim(self):
         import install_tools

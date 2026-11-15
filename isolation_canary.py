@@ -40,27 +40,16 @@ try:
     run('boot-ready','xcrun','simctl','bootstatus',device,'-b')
     command[command.index('-destination')+1] = 'platform=iOS Simulator,id='+device
     command += ['test-without-building']
-    started = time.monotonic()
-    print('native-canary phase=tests starting', flush=True)
-    process = subprocess.Popen(command)
-    saw_service = saw_app = saw_tests = False
-    while process.poll() is None:
-        rows = subprocess.check_output(['ps','-axo','uid=,comm='],text=True)
-        for row in rows.splitlines():
-            parts = row.strip().split(None,1)
-            if len(parts) != 2: continue
-            uid, name = int(parts[0]), parts[1]
-            if uid == os.getuid() and 'CoreSimulatorService' in name: saw_service = True
-            if '/Canary.app/Canary' in name:
-                assert uid == os.getuid()
-                saw_app = True
-            if 'CanaryUITests-Runner' in name or '/Canary.app/' in name and 'xctest' in name:
-                assert uid == os.getuid()
-                saw_tests = True
-        time.sleep(.2)
-    assert process.returncode == 0
-    assert saw_service and saw_app and saw_tests, 'Required native process UID evidence is missing'
-    print('native-canary phase=tests elapsed='+str(round(time.monotonic()-started, 3)), flush=True)
+    assert os.getuid() == os.geteuid() == __EXPECTED_UID__, 'Native driver UID differs from the reserved worker'
+    rows = subprocess.check_output(['ps','-ww','-axo','uid=,pid=,comm='],text=True)
+    services = []
+    for row in rows.splitlines():
+        parts = row.strip().split(None,2)
+        if len(parts) == 3 and 'CoreSimulatorService' in parts[2]:
+            services.append(dict(uid=int(parts[0]),pid=int(parts[1]),command=parts[2]))
+    print('native-canary service-owners='+json.dumps(services), flush=True)
+    assert any(row['uid'] == __EXPECTED_UID__ for row in services), 'Worker-owned CoreSimulatorService is missing'
+    run('tests',*command)
     print('native-canary uid-checks=passed', flush=True)
 finally:
     state = json.loads(subprocess.check_output(['xcrun','simctl','list','devices','--json']))['devices']
@@ -79,24 +68,40 @@ def main():
     (worker / "evidence").mkdir()
     ci.write_json(root / "evidence/receipt.json", dict(identity="runner-only-canary"))
     env = ci.execution_environment(worker / "evidence")
+    isolated = PrivateUser(root, ["isolation.log", "canary.log"])
     if os.environ["RUNNER_OS"] == "macOS":
         source = worker / "source"
         for name in ["App", "Tests", "UITests"]:
             (source / name).mkdir()
-        (source / "App/Canary.swift").write_text('''import SwiftUI
-@main struct Canary: App { var body: some Scene { WindowGroup {
-Text("CI Canary").accessibilityIdentifier("canary") } } }
-''')
-        (source / "Tests/CanaryTests.swift").write_text('''import XCTest
-final class CanaryTests: XCTestCase { func testRuns() { XCTAssertEqual(2 + 2, 4) } }
-''')
-        (source / "UITests/CanaryUITests.swift").write_text('''import XCTest
+        (source / "App/Canary.swift").write_text(r'''import Darwin
+import SwiftUI
+@main struct Canary: App {
+init() { precondition(getuid() == __EXPECTED_UID__ && geteuid() == __EXPECTED_UID__) }
+var body: some Scene { WindowGroup {
+Text(verbatim: "CI Canary \(getuid())").accessibilityIdentifier("canary") } } }
+'''.replace("__EXPECTED_UID__", str(isolated.uid)))
+        (source / "Tests/CanaryTests.swift").write_text(r'''import Darwin
+import XCTest
+final class CanaryTests: XCTestCase { func testRuns() {
+XCTAssertEqual(getuid(), __EXPECTED_UID__)
+XCTAssertEqual(geteuid(), __EXPECTED_UID__)
+print("native-canary unit uid=\(getuid()) euid=\(geteuid())")
+XCTAssertEqual(2 + 2, 4) } }
+'''.replace("__EXPECTED_UID__", str(isolated.uid)))
+        (source / "UITests/CanaryUITests.swift").write_text(r'''import Darwin
+import XCTest
 final class CanaryUITests: XCTestCase {
-func testLaunch() { let app = XCUIApplication(); app.launch()
-XCTAssertTrue(app.staticTexts["canary"].waitForExistence(timeout: 10))
-Thread.sleep(forTimeInterval: 2) }
+func testLaunch() {
+XCTAssertEqual(getuid(), __EXPECTED_UID__)
+XCTAssertEqual(geteuid(), __EXPECTED_UID__)
+print("native-canary ui-runner uid=\(getuid()) euid=\(geteuid())")
+let app = XCUIApplication(); app.launch()
+let label = app.staticTexts["canary"]
+XCTAssertTrue(label.waitForExistence(timeout: 10))
+XCTAssertEqual(label.label, "CI Canary __EXPECTED_UID__")
+print("native-canary app-label=\(label.label)") }
 }
-''')
+'''.replace("__EXPECTED_UID__", str(isolated.uid)))
         (source / "project.yml").write_text('''name: Canary
 options:
   deploymentTarget:
@@ -134,14 +139,14 @@ schemes:
     test:
       targets: [CanaryTests, CanaryUITests]
 ''')
-    with PrivateUser(root, ["isolation.log", "canary.log"]) as isolated:
+    with isolated:
         isolated.probe(env)
         program = ("import os,pathlib; print('::error::PRIVATE_CANARY_OUTPUT'); "
                    "pathlib.Path(os.environ['GITHUB_STEP_SUMMARY']).write_text('private command output')")
         isolated.run([sys.executable, "-c", program],
                      worker / "source", "canary.log", env, 30)
         if os.environ["RUNNER_OS"] == "macOS":
-            isolated.run([sys.executable, "-c", NATIVE], worker / "source", "canary.log", env, NATIVE_TIMEOUT)
+            isolated.run([sys.executable, "-c", NATIVE.replace("__EXPECTED_UID__", str(isolated.uid))], worker / "source", "canary.log", env, NATIVE_TIMEOUT)
     assert "PRIVATE_CANARY_OUTPUT" in (root / "evidence/canary.log").read_text()
     assert "boundary-ok" in (root / "evidence/isolation.log").read_text()
     assert json.loads((root / "evidence/receipt.json").read_text()) == dict(identity="runner-only-canary")
