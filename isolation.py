@@ -201,7 +201,8 @@ class PrivateUser:
                     self.moved = False
                 self.sudo("dscl", ".", "-delete", "/Users/" + self.username) if self.macos else self.sudo("userdel", self.username)
                 self.created = False
-                shutil.rmtree(self.home)
+                # The parent of this job-created home belongs to root.
+                self.sudo("rm", "-rf", self.home)
         finally:
             for output in self.logs.values():
                 output.close()

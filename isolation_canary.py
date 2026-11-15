@@ -29,7 +29,9 @@ try:
     command = ['xcodebuild','-project','Canary.xcodeproj','-scheme','Canary','-configuration','Debug',
                '-destination','platform=iOS Simulator,id='+device,'-derivedDataPath',str(root/'build'),
                '-jobs','2','-parallel-testing-enabled','NO','COMPILER_INDEX_STORE_ENABLE=NO',
-               'CODE_SIGNING_ALLOWED=NO','test']
+               'CODE_SIGNING_ALLOWED=NO']
+    run(*command, 'build-for-testing')
+    command += ['test-without-building']
     process = subprocess.Popen(command)
     saw_service = saw_app = saw_tests = False
     while process.poll() is None:
