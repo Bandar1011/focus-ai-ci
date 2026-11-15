@@ -1,0 +1,3 @@
+# GitHub's hosted Xcode image was added after actionlint 1.7.12.
+self-hosted-runner:
+  labels: [xcode-27]

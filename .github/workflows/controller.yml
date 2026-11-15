@@ -1,0 +1,95 @@
+name: Job controller
+on:
+  push:
+    branches: [main]
+  schedule:
+    # 18:00 and 00:00 Asia/Riyadh. GitHub may delay scheduled starts.
+    - cron: '0 15,21 * * *'
+  workflow_run:
+    workflows: [Private verification]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      kind:
+        description: Verification to request
+        type: choice
+        options: [quick, full]
+        default: quick
+      slot:
+        description: Opaque branch slot (empty selects the default branch)
+        type: string
+        default: ''
+      status:
+        description: Opaque private snapshot (empty selects the default branch)
+        type: string
+        default: ''
+      force:
+        description: Explicitly investigate unchanged inputs again
+        type: boolean
+        default: false
+permissions:
+  contents: read
+jobs:
+  route:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-slim
+    timeout-minutes: 2
+    outputs:
+      kind: ${{ steps.route.outputs.kind }}
+      slot: ${{ steps.route.outputs.slot }}
+      group: ${{ steps.route.outputs.group }}
+      run_id: ${{ steps.route.outputs.run_id }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Route event without private credentials
+        id: route
+        env:
+          CI_DEFAULT_SLOT: ${{ vars.CI_DEFAULT_SLOT }}
+        run: python3 ci.py route
+  controller:
+    needs: route
+    environment: ci
+    runs-on: ubuntu-slim
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      actions: write
+    concurrency:
+      group: controller-${{ needs.route.outputs.group }}
+      cancel-in-progress: false
+    env:
+      REPORT_RECIPIENT: ${{ vars.REPORT_RECIPIENT }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Install verified public tools
+        run: python3 install_tools.py
+      - name: Request verification or reconcile its completion
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CI_SOURCE_REPOSITORY: ${{ secrets.CI_SOURCE_REPOSITORY }}
+          CI_SOURCE_TOKEN: ${{ secrets.CI_SOURCE_TOKEN }}
+          CI_SOURCE_DEFAULT_REF: development
+          CI_SELECTED_KIND: ${{ needs.route.outputs.kind }}
+          CI_SELECTED_SLOT: ${{ needs.route.outputs.slot }}
+          CI_COMPLETED_RUN_ID: ${{ needs.route.outputs.run_id }}
+          CI_REQUEST_STATUS: ${{ inputs.status }}
+          CI_FORCE: ${{ inputs.force || false }}
+        run: python3 ci.py controller
+      - name: Encrypt controller diagnostics
+        if: always()
+        run: python3 ci.py seal
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: always()
+        with:
+          name: controller-${{ github.run_id }}-attempt-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/ci-encrypted/report.tar.age
+          if-no-files-found: error
+          retention-days: 7
+      - name: Remove owned private files
+        if: always()
+        run: python3 ci.py cleanup
