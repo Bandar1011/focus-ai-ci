@@ -135,7 +135,8 @@ class PrivateUser:
                 if path.exists():
                     path.chmod(0o700)
             self.sudo("mkdir", self.home / "tools", self.home / "tmp")
-            for name in ["actionlint", "simslim", "xcodegen"]:
+            # XcodeGen needs the presets beside its installed executable.
+            for name in ["actionlint", "simslim"]:
                 executable = shutil.which(name)
                 if executable:
                     self.sudo("cp", str(Path(executable).resolve()), self.home / "tools" / name)
@@ -166,7 +167,7 @@ class PrivateUser:
         arguments = prefix + [name + "=" + value for name, value in values.items()]
         arguments += ["/bin/sh", "-c", 'cd "$1" && shift && exec "$@"', "ci-private",
                       self.mapped(cwd), *[self.mapped(part) for part in command]]
-        run_private(arguments, None, self.logs[log], dict(os.environ), timeout, privileged=True)
+        run_private(arguments, "/", self.logs[log], dict(os.environ), timeout, privileged=True)
 
     def probe(self, env):
         import json
