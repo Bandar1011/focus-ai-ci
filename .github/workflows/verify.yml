@@ -1,0 +1,67 @@
+name: Private verification
+run-name: '${{ inputs.kind }}:${{ inputs.slot }}:${{ inputs.request }}'
+on:
+  workflow_dispatch:
+    inputs:
+      kind:
+        description: Verification kind
+        type: choice
+        options: [quick, full]
+        required: true
+      slot:
+        description: Opaque current candidate slot
+        type: string
+        required: true
+      request:
+        description: Opaque immutable verification request
+        type: string
+        required: true
+permissions:
+  contents: read
+concurrency:
+  group: ${{ inputs.kind == 'full' && 'public-full' || format('quick-{0}', inputs.slot) }}
+  cancel-in-progress: ${{ inputs.kind == 'quick' }}
+jobs:
+  verify:
+    if: github.ref == 'refs/heads/main'
+    environment: ci
+    runs-on: ${{ inputs.kind == 'full' && 'xcode-27' || 'ubuntu-24.04' }}
+    timeout-minutes: 65
+    env:
+      REPORT_RECIPIENT: ${{ vars.REPORT_RECIPIENT }}
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.12'
+      - name: Install verified public tools
+        env:
+          CI_NATIVE_TOOLS: ${{ inputs.kind == 'full' }}
+        run: python3 install_tools.py
+      - name: Fetch immutable private inputs
+        env:
+          CI_SOURCE_REPOSITORY: ${{ secrets.CI_SOURCE_REPOSITORY }}
+          CI_SOURCE_TOKEN: ${{ secrets.CI_SOURCE_TOKEN }}
+          CI_SOURCE_DEFAULT_REF: development
+          CI_KIND: ${{ inputs.kind }}
+          CI_REQUEST: ${{ inputs.request }}
+          CI_SLOT: ${{ inputs.slot }}
+        run: python3 ci.py checkout
+      - name: Run verification with private output
+        run: python3 ci.py execute
+      - name: Encrypt all verification evidence
+        if: always()
+        run: python3 ci.py seal
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: always()
+        with:
+          name: report-${{ inputs.kind }}-${{ inputs.request }}-attempt-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/ci-encrypted/report.tar.age
+          if-no-files-found: error
+          retention-days: 14
+      - name: Remove owned private files
+        if: always()
+        run: python3 ci.py cleanup

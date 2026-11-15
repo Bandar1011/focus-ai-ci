@@ -1,0 +1,70 @@
+name: Job controller
+on:
+  push:
+    branches: [main]
+  schedule:
+    - cron: '*/15 * * * *'
+    - cron: '7 15,21 * * *'
+  workflow_dispatch:
+    inputs:
+      kind:
+        description: Verification to request for the selected candidate
+        type: choice
+        options: [quick, full]
+        default: quick
+      slot:
+        description: Opaque candidate slot (empty selects the default branch)
+        type: string
+        default: ''
+      force:
+        description: Explicitly investigate unchanged inputs again
+        type: boolean
+        default: false
+permissions:
+  contents: read
+  actions: write
+concurrency:
+  group: job-controller
+  cancel-in-progress: false
+jobs:
+  controller:
+    if: github.ref == 'refs/heads/main'
+    environment: ci
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    env:
+      REPORT_RECIPIENT: ${{ vars.REPORT_RECIPIENT }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.12'
+      - name: Install verified public tools
+        run: python3 install_tools.py
+      - name: Reconcile and schedule verification
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CI_SOURCE_REPOSITORY: ${{ secrets.CI_SOURCE_REPOSITORY }}
+          CI_SOURCE_TOKEN: ${{ secrets.CI_SOURCE_TOKEN }}
+          CI_SOURCE_DEFAULT_REF: development
+          CI_MANUAL: ${{ github.event_name == 'workflow_dispatch' }}
+          CI_SELECTED_KIND: ${{ inputs.kind || 'quick' }}
+          CI_SELECTED_SLOT: ${{ inputs.slot }}
+          CI_FORCE: ${{ inputs.force || false }}
+          CI_FULL_DUE: ${{ github.event.schedule == '7 15,21 * * *' }}
+        run: python3 ci.py controller
+      - name: Encrypt controller diagnostics
+        if: always()
+        run: python3 ci.py seal
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: always()
+        with:
+          name: controller-${{ github.run_id }}-attempt-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/ci-encrypted/report.tar.age
+          if-no-files-found: error
+          retention-days: 7
+      - name: Remove owned private files
+        if: always()
+        run: python3 ci.py cleanup
