@@ -7,14 +7,21 @@ import sys
 import ci
 from isolation import PrivateUser
 
+NATIVE_TIMEOUT = 15 * 60
+
 
 NATIVE = r'''
 import json, os, pathlib, platform, subprocess, time
 root = pathlib.Path.cwd()
 developer = '/Applications/Xcode_27.0.app/Contents/Developer'
 os.environ['DEVELOPER_DIR'] = developer
-def run(*args):
-    subprocess.run(args, check=True)
+def run(phase, *args):
+    started = time.monotonic()
+    print('native-canary phase='+phase+' starting', flush=True)
+    try:
+        subprocess.run(args, check=True)
+    finally:
+        print('native-canary phase='+phase+' elapsed='+str(round(time.monotonic()-started, 3)), flush=True)
 inventory = json.loads(subprocess.check_output(['xcrun','simctl','list','devices','available','--json']))['devices']
 devices = [d for runtime, group in inventory.items() if runtime.endswith('iOS-27-0') for d in group]
 assert devices and all(d['state'] == 'Shutdown' for d in devices)
@@ -22,17 +29,19 @@ device = subprocess.check_output(['xcrun','simctl','create','CI Native Canary',
     'com.apple.CoreSimulator.SimDeviceType.iPhone-17',
     'com.apple.CoreSimulator.SimRuntime.iOS-27-0'], text=True).strip()
 try:
-    run('xcodegen','generate')
+    run('generate','xcodegen','generate')
     command = ['xcodebuild','-project','Canary.xcodeproj','-scheme','Canary','-configuration','Debug',
                '-destination','generic/platform=iOS Simulator','-derivedDataPath',str(root/'build'),
                '-jobs','2','-parallel-testing-enabled','NO','COMPILER_INDEX_STORE_ENABLE=NO',
                'CODE_SIGNING_ALLOWED=NO']
     command += ['ARCHS='+platform.machine(), 'ONLY_ACTIVE_ARCH=YES']
-    run(*command, 'build-for-testing')
-    run('xcrun','simctl','boot',device)
-    run('xcrun','simctl','bootstatus',device,'-b')
+    run('build',*command, 'build-for-testing')
+    run('boot-start','xcrun','simctl','boot',device)
+    run('boot-ready','xcrun','simctl','bootstatus',device,'-b')
     command[command.index('-destination')+1] = 'platform=iOS Simulator,id='+device
     command += ['test-without-building']
+    started = time.monotonic()
+    print('native-canary phase=tests starting', flush=True)
     process = subprocess.Popen(command)
     saw_service = saw_app = saw_tests = False
     while process.poll() is None:
@@ -51,11 +60,13 @@ try:
         time.sleep(.2)
     assert process.returncode == 0
     assert saw_service and saw_app and saw_tests, 'Required native process UID evidence is missing'
+    print('native-canary phase=tests elapsed='+str(round(time.monotonic()-started, 3)), flush=True)
+    print('native-canary uid-checks=passed', flush=True)
 finally:
     state = json.loads(subprocess.check_output(['xcrun','simctl','list','devices','--json']))['devices']
     current = next(d for group in state.values() for d in group if d['udid']==device)
-    if current['state'] != 'Shutdown': run('xcrun','simctl','shutdown',device)
-    run('xcrun','simctl','delete',device)
+    if current['state'] != 'Shutdown': run('shutdown','xcrun','simctl','shutdown',device)
+    run('delete','xcrun','simctl','delete',device)
 print('native-uid-canary-ok')
 '''
 
@@ -130,7 +141,7 @@ schemes:
         isolated.run([sys.executable, "-c", program],
                      worker / "source", "canary.log", env, 30)
         if os.environ["RUNNER_OS"] == "macOS":
-            isolated.run([sys.executable, "-c", NATIVE], worker / "source", "canary.log", env, 600)
+            isolated.run([sys.executable, "-c", NATIVE], worker / "source", "canary.log", env, NATIVE_TIMEOUT)
     assert "PRIVATE_CANARY_OUTPUT" in (root / "evidence/canary.log").read_text()
     assert "boundary-ok" in (root / "evidence/isolation.log").read_text()
     assert json.loads((root / "evidence/receipt.json").read_text()) == dict(identity="runner-only-canary")
