@@ -31,6 +31,7 @@ STATUS_ID = re.compile(r"[A-Za-z0-9_=-]{8,256}\Z")
 SLOT = re.compile(r"[0-9a-f]{16}\Z")
 WORKFLOW = ".github/workflows/verify.yml"
 MAX_PAGES = 20
+GITHUB_ACTIONS_BOT_ID = 41898282
 
 
 def request_key(kind, source_sha, control_sha, pipeline_sha, recipient):
@@ -77,7 +78,7 @@ class GitHub:
         if not STATUS_ID.fullmatch(node_id):
             raise ValueError("Invalid opaque status identifier.")
         query = """query($id:ID!){node(id:$id){__typename ... on StatusContext {
-          id context description state targetUrl creator{login}
+          id context description state targetUrl creator{login __typename ... on Bot{databaseId}}
           commit{oid repository{nameWithOwner isPrivate}}
         }}}"""
         result = self.request("POST", "https://api.github.com/graphql",
@@ -103,8 +104,10 @@ def load_snapshot(source, node_id, kind, slot, pipeline_sha, recipient, allow_dr
     node = source.status_node(node_id)
     commit = node.get("commit") or {}
     repository = commit.get("repository") or {}
-    creator = (node.get("creator") or {}).get("login", "").casefold()
+    creator = node.get("creator") or {}
     owner_login = source.repository.split("/")[0].casefold()
+    is_owner = creator.get("__typename") == "User" and creator.get("login", "").casefold() == owner_login
+    is_actions = creator.get("__typename") == "Bot" and creator.get("databaseId") == GITHUB_ACTIONS_BOT_ID
     if (node.get("__typename") != "StatusContext" or node.get("id") != node_id
             or node.get("context") != "ci/public-" + kind
             or repository.get("nameWithOwner", "").casefold() != source.repository.casefold()
@@ -113,11 +116,11 @@ def load_snapshot(source, node_id, kind, slot, pipeline_sha, recipient, allow_dr
     description = node.get("description", "")
     frozen = STATUS_KEY.fullmatch(description)
     draft = SNAPSHOT.fullmatch(description) if allow_draft else None
-    if frozen and creator == owner_login:
+    if frozen and is_owner:
         control, key = frozen[2], frozen[1]
         if key != request_key(kind, commit["oid"], control, pipeline_sha, recipient):
             raise ValueError("Request does not bind the frozen source, control, pipeline and recipient.")
-    elif draft and creator in {owner_login, "github-actions[bot]"} and draft[2] == slot:
+    elif draft and (is_owner or is_actions) and draft[2] == slot:
         control, key = draft[1], None
     else:
         raise ValueError("Private request has no trusted immutable snapshot.")
