@@ -272,6 +272,36 @@ class ExecutionTests(unittest.TestCase):
         self.assertIn(secret, (evidence / "execution.log").read_text())
         self.assertIn(secret, (evidence / "github_step_summary.txt").read_text())
 
+    def test_worker_cannot_redirect_the_trusted_receipt_into_runner_owned_output(self):
+        root = self.root / "ci-private"
+        ci.prepare(root, "17-1")
+        public_file = self.root / "public-output"
+        public_file.write_text("unchanged public output")
+        values = dict(RUNNER_TEMP=str(self.root), GITHUB_REF="refs/heads/main", GITHUB_SHA=PIPELINE,
+                      GITHUB_RUN_ID="17", GITHUB_RUN_ATTEMPT="1", CI_SOURCE_REPOSITORY=SOURCE,
+                      CI_SOURCE_TOKEN="test-token", CI_KIND="quick", CI_REQUEST=key(),
+                      CI_SLOT=CANDIDATE.slot, CI_STATUS=NODE, REPORT_RECIPIENT=RECIPIENT)
+        class HostileWorker:
+            def __init__(self, *_): pass
+            def __enter__(self): return self
+            def __exit__(self, *_): pass
+            def probe(self, *_): pass
+            def run(self, _command, cwd, *_):
+                output = Path(cwd).parent / "evidence"
+                output.mkdir(exist_ok=True)
+                target = output / "receipt.json"
+                target.unlink(missing_ok=True)
+                target.symlink_to(public_file)
+        def fetch(_repo, _sha, destination, *_):
+            destination.mkdir()
+        with patch.dict(os.environ, values), patch.object(ci, "load_snapshot", return_value=(CANDIDATE,key())), \
+                patch.object(ci,"fetch_commit",side_effect=fetch), patch.object(ci,"PrivateUser",HostileWorker):
+            ci.checkout()
+            ci.execute()
+        self.assertEqual(public_file.read_text(),"unchanged public output")
+        self.assertFalse((root / "evidence/receipt.json").is_symlink())
+        self.assertEqual(json.loads((root / "evidence/receipt.json").read_text())["status"],"passed")
+
     def test_failure_details_are_never_printed_to_public_console(self):
         temp = self.root / "runner"
         temp.mkdir()
@@ -430,6 +460,71 @@ class EncryptionTests(unittest.TestCase):
         self.assertFalse(self.destination.exists())
         self.assertEqual(list(self.destination.parent.iterdir()), [])
         self.assertTrue((self.evidence / "execution.log").is_file())
+
+    def test_report_links_are_rejected_before_starting_encryption(self):
+        (self.evidence / "linked-report").symlink_to("/dev/stdout")
+        with patch.object(ci.subprocess,"Popen") as encryption, self.assertRaises(RuntimeError):
+            ci.seal(self.evidence,self.destination,RECIPIENT)
+        encryption.assert_not_called()
+        self.assertFalse(self.destination.exists())
+
+
+class EvidenceBoundaryTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary=tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.root=Path(self.temporary.name)
+        self.home=self.root/"worker-home"
+        self.evidence=self.home/"work/evidence"
+        self.evidence.mkdir(parents=True)
+        self.output=self.root/"trusted-copy"
+
+    def collect(self):
+        isolation.collect_evidence(self.home,self.output,os.getuid(),os.getuid(),os.getgid())
+
+    def test_regular_worker_reports_are_copied_as_new_nonexecutable_runner_files(self):
+        report=self.evidence/"checks/native.json"
+        report.parent.mkdir()
+        report.write_text('{"status":"passed"}')
+        report.chmod(0o777)
+        self.collect()
+        copied=self.output/"checks/native.json"
+        self.assertEqual(copied.read_text(),report.read_text())
+        self.assertNotEqual(copied.stat().st_ino,report.stat().st_ino)
+        self.assertEqual(copied.stat().st_mode & 0o777,0o600)
+
+    def test_symlinks_hardlinks_and_special_files_cannot_be_imported(self):
+        outside=self.root/"runner-owned"
+        outside.write_text("unchanged")
+        candidate=self.evidence/"receipt.json"
+        for kind in ["stdout","runner-file","hardlink","fifo"]:
+            with self.subTest(kind=kind):
+                if kind=="stdout":candidate.symlink_to("/dev/stdout")
+                elif kind=="runner-file":candidate.symlink_to(outside)
+                elif kind=="hardlink":os.link(outside,candidate)
+                else:os.mkfifo(candidate)
+                with self.assertRaises((RuntimeError,OSError)):self.collect()
+                self.assertFalse(self.output.exists())
+                self.assertEqual(outside.read_text(),"unchanged")
+                candidate.unlink()
+
+    def test_worker_cannot_redirect_a_parent_directory_of_the_report_tree(self):
+        self.evidence.rmdir()
+        (self.home/"work").rmdir()
+        (self.home/"work").symlink_to(self.root,target_is_directory=True)
+        with self.assertRaises(OSError):self.collect()
+        self.assertFalse(self.output.exists())
+
+    def test_trusted_writes_never_follow_links_or_truncate_a_linked_runner_file(self):
+        original=self.root/"original"
+        original.write_text("keep this")
+        output=self.root/"receipt.json"
+        output.symlink_to(original)
+        with self.assertRaises(OSError):ci.write_json(output,dict(private="data"))
+        self.assertEqual(original.read_text(),"keep this")
+        output.unlink();os.link(original,output)
+        with self.assertRaises(RuntimeError):ci.write_json(output,dict(private="data"))
+        self.assertEqual(original.read_text(),"keep this")
 
 
 if __name__ == "__main__":

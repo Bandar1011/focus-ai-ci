@@ -11,6 +11,7 @@ from pathlib import Path
 import re
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import tarfile
@@ -361,7 +362,25 @@ def clean_private(root, identity):
 
 
 def write_json(path, value):
-    path.write_text(json.dumps(value, sort_keys=True, indent=2) + "\n")
+    with private_file(path, "w") as output:
+        output.write(json.dumps(value, sort_keys=True, indent=2) + "\n")
+
+
+def private_file(path, mode):
+    flags = os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK
+    if mode.startswith("a"):
+        flags |= os.O_APPEND
+    descriptor = os.open(path, flags, 0o600)
+    try:
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+            raise RuntimeError("Private evidence must be an unlinked regular file.")
+        if mode.startswith("w"):
+            os.ftruncate(descriptor, 0)
+        return os.fdopen(descriptor, mode)
+    except BaseException:
+        os.close(descriptor)
+        raise
 
 
 def fetch_commit(repository, sha, destination, credentials, log, token):
@@ -382,7 +401,7 @@ def fetch_commit(repository, sha, destination, credentials, log, token):
                 ["git", "-C", str(destination), "fetch", "--quiet", "--depth=1", "--no-tags",
                  "https://github.com/" + repository + ".git", sha],
                 ["git", "-C", str(destination), "checkout", "--quiet", "--detach", "FETCH_HEAD"]]
-    with log.open("ab") as output:
+    with private_file(log, "ab") as output:
         for command in commands:
             subprocess.run(command, env=env, stdout=output, stderr=subprocess.STDOUT,
                            check=True, timeout=300)
@@ -412,16 +431,19 @@ def checkout():
                    run_id=os.environ["GITHUB_RUN_ID"],
                    run_attempt=int(os.environ.get("GITHUB_RUN_ATTEMPT", "1")), status="incomplete")
     write_json(root / "evidence/receipt.json", receipt)
+    worker = root / "worker"
+    worker.mkdir(mode=0o700)
+    (worker / "evidence").mkdir(mode=0o700)
     credentials = root / "credentials"
     try:
-        fetch_commit(source.repository, candidate.source_sha, root / "source", credentials,
+        fetch_commit(source.repository, candidate.source_sha, worker / "source", credentials,
                      root / "evidence/checkout.log", source.token)
-        control = root / "source"
+        control = worker / "source"
         if candidate.control_sha != candidate.source_sha:
-            control = root / "control"
+            control = worker / "control"
             fetch_commit(source.repository, candidate.control_sha, control, credentials,
                          root / "evidence/checkout.log", source.token)
-        write_json(root / "execution.json", dict(source=str(root / "source"), control=str(control)))
+        write_json(root / "execution.json", dict(source=str(worker / "source"), control=str(control)))
     finally:
         shutil.rmtree(credentials, ignore_errors=True)
 
@@ -440,21 +462,22 @@ def execution_environment(evidence):
 def execute():
     root = private_root()
     evidence = root / "evidence"
+    worker_evidence = root / "worker/evidence"
     receipt = json.loads((evidence / "receipt.json").read_text())
     paths = json.loads((root / "execution.json").read_text())
     source, control = Path(paths["source"]), Path(paths["control"])
-    env = execution_environment(evidence)
+    env = execution_environment(worker_evidence)
     workflow_files = list((source / ".github/workflows").glob("*.y*ml"))
     if receipt["kind"] == "quick":
         command = [sys.executable, str(control / "scripts/ci.py"), "quick", "--source", str(source),
-                   "--output", str(evidence / "checks")]
+                   "--output", str(worker_evidence / "checks")]
         timeout = 600
     else:
         config = json.loads((control / "scripts/ci-config.json").read_text())
         if config["runner"] != "xcode-27" or os.environ.get("RUNNER_OS") != "macOS":
             raise RuntimeError("The pinned native runner is unavailable; no implicit substitution.")
         command = [sys.executable, str(control / "scripts/ci_native.py"), "--source", str(source),
-                   "--cache", str(root / "native-cache"), "--output", str(evidence / "checks")]
+                   "--cache", str(root / "worker/native-cache"), "--output", str(worker_evidence / "checks")]
         timeout = 3000
     with PrivateUser(root, ["isolation.log", "actionlint.log", "execution.log"]) as isolated:
         isolated.probe(env)
@@ -471,7 +494,12 @@ def seal(evidence, destination, recipient, age="age"):
     destination.unlink(missing_ok=True)
     process = None
     try:
-        with partial.open("wb") as output, (evidence / "encryption.log").open("ab") as errors:
+        for directory, folders, files in os.walk(evidence, followlinks=False):
+            for name in folders + files:
+                info = (Path(directory) / name).lstat()
+                if not (stat.S_ISDIR(info.st_mode) or stat.S_ISREG(info.st_mode) and info.st_nlink == 1):
+                    raise RuntimeError("Report contains a link or a nonregular file.")
+        with private_file(partial, "wb") as output, private_file(evidence / "encryption.log", "ab") as errors:
             process = subprocess.Popen([age, "--encrypt", "--recipient", recipient],
                                        stdin=subprocess.PIPE, stdout=output, stderr=errors)
             with tarfile.open(fileobj=process.stdin, mode="w|gz", dereference=False) as archive:
@@ -517,7 +545,7 @@ def main():
         # another execution's workspace, including failures during preparation.
         try:
             if owned_workspace(root, owner()):
-                with (root / "evidence/errors.log").open("a") as errors:
+                with private_file(root / "evidence/errors.log", "a") as errors:
                     traceback.print_exc(file=errors)
                 receipt_path = root / "evidence/receipt.json"
                 if receipt_path.exists() and args.command in {"checkout", "execute"}:

@@ -8,6 +8,7 @@ import platform
 import pwd
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import time
@@ -45,6 +46,51 @@ print('boundary-ok')
 
 class CleanupError(RuntimeError):
     pass
+
+
+def collect_evidence(home, destination, source_uid, target_uid, target_gid):
+    """Copy only regular worker reports into a new runner-owned directory."""
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    descriptors = []
+    try:
+        for name in [str(home), "work", "evidence"]:
+            descriptor = os.open(name, flags, dir_fd=descriptors[-1] if descriptors else None)
+            descriptors.append(descriptor)
+        destination.mkdir(mode=0o700)
+        os.chown(destination, target_uid, target_gid)
+        def copy_directory(source, target):
+            for name in os.listdir(source):
+                info = os.stat(name, dir_fd=source, follow_symlinks=False)
+                if (info.st_uid != source_uid or not (stat.S_ISDIR(info.st_mode)
+                        or stat.S_ISREG(info.st_mode) and info.st_nlink == 1)):
+                    raise RuntimeError("Worker evidence contains a link, special file or foreign owner.")
+                entry = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+                                dir_fd=source)
+                try:
+                    opened = os.fstat(entry)
+                    if (opened.st_dev, opened.st_ino, opened.st_mode, opened.st_nlink, opened.st_uid) != (
+                            info.st_dev, info.st_ino, info.st_mode, info.st_nlink, info.st_uid):
+                        raise RuntimeError("Worker evidence changed during collection.")
+                    path = target / name
+                    if stat.S_ISDIR(info.st_mode):
+                        path.mkdir(mode=0o700)
+                        os.chown(path, target_uid, target_gid)
+                        copy_directory(entry, path)
+                    else:
+                        with os.fdopen(os.dup(entry), "rb") as reader, path.open("xb") as writer:
+                            shutil.copyfileobj(reader, writer, length=1024 * 1024)
+                            os.fchmod(writer.fileno(), 0o600)
+                            os.fchown(writer.fileno(), target_uid, target_gid)
+                finally:
+                    os.close(entry)
+        try:
+            copy_directory(descriptors[-1], destination)
+        except BaseException:
+            shutil.rmtree(destination)
+            raise
+    finally:
+        for descriptor in reversed(descriptors):
+            os.close(descriptor)
 
 
 def active_group(group):
@@ -86,7 +132,8 @@ class PrivateUser:
         if (os.environ.get("GITHUB_ACTIONS") != "true"
                 or os.environ.get("RUNNER_ENVIRONMENT") != "github-hosted"):
             raise RuntimeError("Private account setup is restricted to ephemeral GitHub-hosted runners.")
-        self.original = root.resolve()
+        self.original = (root / "worker").resolve()
+        self.destination = root / "evidence/worker"
         self.username, self.uid = "ciworker", 60001
         self.macos = platform.system() == "Darwin"
         self.home = Path("/Users" if self.macos else "/home") / self.username
@@ -142,7 +189,7 @@ class PrivateUser:
                     self.sudo("cp", str(Path(executable).resolve()), self.home / "tools" / name)
             self.sudo("mv", self.original, self.root)
             self.moved = True
-            self.sudo("chown", "-R", str(self.uid), self.home)
+            self.sudo("chown", "-R", "-P", str(self.uid), self.home)
             if self.macos:
                 self.sudo("launchctl", "bootstrap", "user/" + str(self.uid))
             return self
@@ -172,6 +219,8 @@ class PrivateUser:
     def probe(self, env):
         import json
         protected = [str(Path(os.environ["GITHUB_WORKSPACE"]) / "ci.py")]
+        protected += [str(self.original.parent / "evidence/receipt.json"),
+                      str(self.original.parent / "execution.json")]
         protected += [os.environ[name] for name in ["GITHUB_OUTPUT", "GITHUB_ENV", "GITHUB_PATH", "GITHUB_STEP_SUMMARY"]
                       if os.environ.get(name)]
         self.run([sys.executable, "-c", PROBE, json.dumps(protected), str(os.getpid()), str(self.original_uid)],
@@ -186,7 +235,9 @@ class PrivateUser:
         try:
             if self.created:
                 if self.macos:
-                    self.sudo("launchctl", "bootout", "user/" + str(self.uid), check=False)
+                    stopped = self.sudo("launchctl", "bootout", "user/" + str(self.uid), check=False)
+                    if stopped.returncode not in {0, 113}:
+                        raise CleanupError("Private user service shutdown is unconfirmed.")
                 for sig, grace in [("-TERM", 1), ("-KILL", 3)]:
                     self.sudo("pkill", sig, "-U", str(self.uid), check=False)
                     deadline = time.monotonic() + grace
@@ -194,19 +245,23 @@ class PrivateUser:
                         time.sleep(0.05)
                 if self.active():
                     raise CleanupError("Private user processes remain; retain its workspace.")
-                self.sudo("chown", "-R", "-P", f"{self.original_uid}:{self.original_gid}", self.home)
-                if self.moved:
-                    if self.root.is_symlink() or not (self.root / ".owned").is_file():
-                        raise CleanupError("Private workspace identity was replaced.")
-                    shutil.move(str(self.root), str(self.original))
-                    self.moved = False
-                self.sudo("dscl", ".", "-delete", "/Users/" + self.username) if self.macos else self.sudo("userdel", self.username)
-                self.created = False
-                # The parent of this job-created home belongs to root.
-                self.sudo("rm", "-rf", self.home)
+                try:
+                    if self.moved:
+                        self.sudo(sys.executable, Path(__file__).resolve(), "collect", self.home,
+                                  self.destination, str(self.uid), str(self.original_uid), str(self.original_gid))
+                finally:
+                    self.sudo("dscl", ".", "-delete", "/Users/" + self.username) if self.macos else self.sudo("userdel", self.username)
+                    self.created = False
+                    self.sudo("rm", "-rf", self.home)
         finally:
             for output in self.logs.values():
                 output.close()
 
     def __exit__(self, *exception):
         self.close()
+
+
+if __name__ == "__main__":
+    if len(sys.argv) != 7 or sys.argv[1] != "collect" or os.getuid() != 0:
+        raise SystemExit("Evidence collection requires the trusted privileged caller.")
+    collect_evidence(Path(sys.argv[2]), Path(sys.argv[3]), *map(int, sys.argv[4:]))

@@ -59,10 +59,13 @@ print('native-uid-canary-ok')
 def main():
     root = ci.private_root()
     ci.prepare(root, ci.owner())
-    (root / "source").mkdir()
-    env = ci.execution_environment(root / "evidence")
+    worker = root / "worker"
+    (worker / "source").mkdir(parents=True)
+    (worker / "evidence").mkdir()
+    ci.write_json(root / "evidence/receipt.json", dict(identity="runner-only-canary"))
+    env = ci.execution_environment(worker / "evidence")
     if os.environ["RUNNER_OS"] == "macOS":
-        source = root / "source"
+        source = worker / "source"
         for name in ["App", "Tests", "UITests"]:
             (source / name).mkdir()
         (source / "App/Canary.swift").write_text('''import SwiftUI
@@ -118,12 +121,17 @@ schemes:
 ''')
     with PrivateUser(root, ["isolation.log", "canary.log"]) as isolated:
         isolated.probe(env)
-        isolated.run([sys.executable, "-c", "print('::error::PRIVATE_CANARY_OUTPUT')"],
-                     root / "source", "canary.log", env, 30)
+        program = ("import os,pathlib; print('::error::PRIVATE_CANARY_OUTPUT'); "
+                   "pathlib.Path(os.environ['GITHUB_STEP_SUMMARY']).write_text('private command output')")
+        isolated.run([sys.executable, "-c", program],
+                     worker / "source", "canary.log", env, 30)
         if os.environ["RUNNER_OS"] == "macOS":
-            isolated.run([sys.executable, "-c", NATIVE], root / "source", "canary.log", env, 600)
+            isolated.run([sys.executable, "-c", NATIVE], worker / "source", "canary.log", env, 600)
     assert "PRIVATE_CANARY_OUTPUT" in (root / "evidence/canary.log").read_text()
     assert "boundary-ok" in (root / "evidence/isolation.log").read_text()
+    assert json.loads((root / "evidence/receipt.json").read_text()) == dict(identity="runner-only-canary")
+    assert (root / "evidence/worker/github_step_summary.txt").read_text() == "private command output"
+    assert not worker.exists(), "Worker source must not return to the runner's trusted tree"
     ci.write_json(root / "evidence/canary.json", dict(status="passed", runner=os.environ["RUNNER_OS"]))
     print("Hosted account isolation canary passed.")
 
