@@ -5,30 +5,47 @@ import json
 import os
 from pathlib import Path
 import shutil
+import signal
 import subprocess
 import sys
 import tarfile
 import tempfile
+import time
 import unittest
 from unittest.mock import patch
 from urllib.error import HTTPError
 
 import ci
-
+import isolation
 
 SOURCE = "owner/private"
 PUBLIC = "owner/ci"
 PIPELINE = "c" * 40
 RECIPIENT = "age1-test-recipient"
-CANDIDATE = ci.Candidate("a" * 40, "b" * 40, "refs/heads/development", "d" * 16)
+NODE = "SC_frozen_request"
+CANDIDATE = ci.Candidate("a" * 40, "b" * 40, "a" * 40, "d" * 16)
 
 
 def key(candidate=CANDIDATE, kind="quick"):
     return ci.request_key(kind, candidate.source_sha, candidate.control_sha, PIPELINE, RECIPIENT)
 
 
+def status(kind="quick", phase="queued", candidate=CANDIDATE, url=None):
+    return dict(node_id=NODE, context="ci/public-"+kind, state="pending", creator=dict(login="owner"),
+                description=f"request:{key(candidate,kind)} control:{candidate.control_sha} {phase}",
+                target_url=url or f"https://github.com/{PUBLIC}/actions/runs/17")
+
+
+def node(kind="quick", **changes):
+    value = dict(__typename="StatusContext", id=NODE, context="ci/public-"+kind,
+                 description=status(kind)["description"], creator=dict(login="owner"),
+                 commit=dict(oid=CANDIDATE.source_sha, repository=dict(nameWithOwner=SOURCE, isPrivate=True)))
+    value.update(changes)
+    return value
+
+
 def run(kind="quick", request=None, **changes):
-    value = dict(id=17, run_attempt=1, display_title=f"{kind}:{CANDIDATE.slot}:{request or key(kind=kind)}",
+    value = dict(id=17, run_attempt=1, display_title=f"{kind}:{CANDIDATE.slot}:{request or key(kind=kind)}:{NODE}",
                  head_sha=PIPELINE, head_branch="main", path=ci.WORKFLOW, event="workflow_dispatch",
                  repository=dict(full_name=PUBLIC), head_repository=dict(full_name=PUBLIC),
                  status="completed", conclusion="success", html_url=f"https://github.com/{PUBLIC}/actions/runs/17")
@@ -37,166 +54,192 @@ def run(kind="quick", request=None, **changes):
 
 
 class FakeAPI:
-    def __init__(self, repository, responses=None, rows=None):
+    def __init__(self, repository, responses=None, rows=None, nodes=None):
         self.repository = repository
         self.responses = responses or {}
         self.rows = rows or {}
+        self.nodes = nodes or {NODE: node()}
         self.writes = []
 
     def api(self, method, path, value=None):
         if method == "GET":
-            return self.responses[path]
+            response = self.responses[path]
+            if isinstance(response, BaseException): raise response
+            return response
         self.writes.append((path, value))
+        if path.startswith("statuses/"):
+            result = dict(value, node_id=NODE, creator=dict(login="owner"))
+            self.rows.setdefault("commits/"+path.removeprefix("statuses/")+"/statuses", []).insert(0,result)
+            return result
+        response = self.responses.get(path, dict(workflow_run_id=17,html_url=run()["html_url"]))
+        if isinstance(response, BaseException): raise response
+        return response
 
     def pages(self, path, field=None):
         yield from self.rows.get(path, [])
 
+    def status_node(self, node_id):
+        return self.nodes[node_id]
+
 
 class ControllerTests(unittest.TestCase):
-    def source(self):
-        return FakeAPI(SOURCE)
+    def source(self, statuses=(), **kwargs):
+        return FakeAPI(SOURCE, rows={"commits/"+CANDIDATE.source_sha+"/statuses":list(statuses)}, **kwargs)
 
     def public(self, worker=None, artifact=True):
         worker = worker or run()
         reports = [dict(name=f"report-quick-{key()}-attempt-{worker['run_attempt']}",
                         expired=False, size_in_bytes=800)] if artifact else []
-        return FakeAPI(PUBLIC, {"actions/runs/17": worker},
-                       {"actions/runs/17/artifacts": reports})
+        return FakeAPI(PUBLIC, {"actions/runs/17":worker}, {"actions/runs/17/artifacts":reports})
 
-    def reconcile(self, source, public, **kwargs):
-        values = dict(candidate=CANDIDATE, kind="quick", pipeline_sha=PIPELINE, recipient=RECIPIENT,
-                      previous=None, recent=[], eligible=True)
-        values.update(kwargs)
-        return ci.reconcile(source, public, **values)
+    def dispatch(self, source, public, **changes):
+        values = dict(candidate=CANDIDATE,kind="quick",pipeline_sha=PIPELINE,recipient=RECIPIENT)
+        values.update(changes)
+        return ci.dispatch_request(source,public,**values)
 
-    def test_active_job_is_reconciled_without_duplicate_dispatch(self):
-        source, worker = self.source(), run(status="in_progress", conclusion=None)
-        public = self.public(worker)
-        result = self.reconcile(source, public, recent=[worker])
-        self.assertEqual(result, "active")
-        self.assertFalse(public.writes)
-        self.assertEqual(source.writes[0][1]["state"], "pending")
-
-    def test_success_requires_current_run_and_ciphertext_from_current_attempt(self):
+    def test_dispatch_freezes_before_starting_and_uses_returned_exact_run_identity(self):
         source, public = self.source(), self.public()
-        self.assertEqual(self.reconcile(source, public, recent=[run()]), "passed")
-        self.assertEqual(source.writes[-1][1]["state"], "success")
+        self.assertEqual(self.dispatch(source,public),"dispatched")
+        self.assertEqual(len(public.writes),1)
+        payload = public.writes[0][1]
+        self.assertTrue(payload["return_run_details"])
+        self.assertEqual(payload["inputs"],dict(kind="quick",slot=CANDIDATE.slot,request=key(),status=NODE))
+        self.assertNotIn(CANDIDATE.source_sha,json.dumps(payload))
+        self.assertEqual(source.writes[0][1]["state"],"pending")
+        self.assertEqual(source.writes[-1][1]["target_url"],run()["html_url"])
+
+    def test_active_run_is_reused_despite_new_alias_draft_without_dispatching_again(self):
+        draft = dict(context="ci/public-quick",description=f"control:{CANDIDATE.control_sha} slot:{CANDIDATE.slot} queued",
+                     creator=dict(login="github-actions[bot]"))
+        source = self.source([draft,status()])
+        public = self.public(run(status="in_progress",conclusion=None))
+        self.assertEqual(self.dispatch(source,public),"active")
+        self.assertFalse(public.writes)
+        self.assertEqual(source.writes[-1][1]["target_url"],run()["html_url"])
+
+    def test_success_requires_whole_run_and_current_attempt_nonexpired_ciphertext(self):
+        for artifact, conclusion, attempt, expected in [(True,"success",1,"passed"),
+                (False,"success",1,"incomplete"),(True,"failure",1,"failed"),
+                (True,"cancelled",1,"incomplete"),(True,"success",2,"incomplete")]:
+            source, public = self.source([status()]), self.public(artifact=artifact)
+            with self.subTest(artifact=artifact,conclusion=conclusion,attempt=attempt):
+                self.assertEqual(ci.finish(source,public,run(conclusion=conclusion,run_attempt=attempt),RECIPIENT),expected)
+                self.assertEqual(source.writes[-1][1]["state"],{"passed":"success","failed":"failure","incomplete":"error"}[expected])
+                self.assertFalse(public.writes)
+        source, public = self.source([status()]), self.public()
         public.rows["actions/runs/17/artifacts"][0]["expired"] = True
-        source.writes.clear()
-        self.assertEqual(self.reconcile(source, public, recent=[run()]), "dispatched")
-        self.assertEqual(source.writes[-1][1]["state"], "pending")
-        self.assertEqual(len(public.writes), 1)
-        public.rows["actions/runs/17/artifacts"][0]["expired"] = False
-        self.assertEqual(self.reconcile(self.source(), public, recent=[run(run_attempt=2)]), "dispatched")
+        self.assertEqual(ci.finish(source,public,run(),RECIPIENT),"incomplete")
 
-    def test_missing_ciphertext_does_not_reuse_a_green_run(self):
-        source, public = self.source(), self.public(artifact=False)
-        self.assertEqual(self.reconcile(source, public, recent=[run()]), "dispatched")
-        self.assertNotIn("success", [value["state"] for _, value in source.writes])
+    def test_old_completion_cannot_overwrite_new_control_or_new_run_on_same_commit(self):
+        changed = ci.Candidate(CANDIDATE.source_sha,"e"*40,CANDIDATE.source_ref,CANDIDATE.slot)
+        for latest in [status(candidate=changed),status(url=f"https://github.com/{PUBLIC}/actions/runs/18"),
+                dict(context="ci/public-quick",description=f"control:{changed.control_sha} slot:{changed.slot} queued")]:
+            source = self.source([latest])
+            self.assertEqual(ci.finish(source,self.public(),run(),RECIPIENT),"superseded")
+            self.assertFalse(source.writes)
 
-    def test_workflow_cleanup_failure_cannot_become_private_success(self):
-        source, public = self.source(), self.public()
-        self.assertEqual(self.reconcile(source, public, recent=[run(conclusion="failure")]), "failed")
-        self.assertEqual(source.writes[-1][1]["state"], "failure")
+    def test_unchanged_failure_and_missing_proof_do_not_automatically_retry(self):
+        for previous in [status(phase="failed",url="https://github.com/owner/ci/actions/workflows/verify.yml"),status()]:
+            source, public = self.source([previous]),self.public(artifact=False)
+            result = self.dispatch(source,public)
+            self.assertIn(result,{"failed","incomplete"})
+            self.assertFalse(public.writes)
+            self.assertNotIn("success",[value["state"] for _,value in source.writes])
+
+    def test_force_reinvestigates_failure_but_never_duplicates_active_work(self):
+        source, public = self.source([status(phase="failed")]), self.public(run(conclusion="failure"))
+        self.assertEqual(self.dispatch(source,public,force=True),"dispatched")
+        source, public = self.source([status()]),self.public(run(status="queued",conclusion=None))
+        self.assertEqual(self.dispatch(source,public,force=True),"active")
         self.assertFalse(public.writes)
 
-    def test_unchanged_failure_is_not_automatically_retried_even_after_history_expires(self):
-        source, public = self.source(), self.public()
-        previous = dict(description=f"request:{key()} failed", state="failure", target_url="")
-        self.assertEqual(self.reconcile(source, public, previous=previous), "failed")
-        self.assertFalse(public.writes)
-        self.assertFalse(source.writes)
+    def test_dispatch_failure_or_missing_returned_run_id_leaves_error_not_green(self):
+        for response in [RuntimeError("indeterminate dispatch"),{},dict(workflow_run_id=17,html_url="https://evil.example/17")]:
+            source, public = self.source(),self.public()
+            public.responses["actions/workflows/verify.yml/dispatches"] = response
+            with self.assertRaises((RuntimeError,KeyError)):
+                self.dispatch(source,public)
+            self.assertEqual(source.writes[-1][1]["state"],"error")
 
-    def test_explicit_force_can_reinvestigate_failure_but_does_not_duplicate_running_work(self):
-        source, public = self.source(), self.public()
-        self.assertEqual(self.reconcile(source, public, recent=[run(conclusion="failure")], force=True), "dispatched")
-        public.writes.clear()
-        self.assertEqual(self.reconcile(source, public, recent=[run(status="queued", conclusion=None)], force=True), "active")
-        self.assertFalse(public.writes)
+    def test_each_bound_input_invalidates_proof(self):
+        inputs = ["quick",CANDIDATE.source_sha,CANDIDATE.control_sha,PIPELINE,RECIPIENT]
+        for index,replacement in enumerate(["full","d"*40,"e"*40,"f"*40,"rotated"]):
+            changed = inputs.copy(); changed[index] = replacement
+            self.assertNotEqual(key(),ci.request_key(*changed))
 
-    def test_every_bound_identity_and_report_recipient_invalidates_previous_proof(self):
-        original = key()
-        inputs = ["quick", CANDIDATE.source_sha, CANDIDATE.control_sha, PIPELINE, RECIPIENT]
-        for index, replacement in enumerate(["full", "d" * 40, "e" * 40, "f" * 40, "rotated-recipient"]):
-            changed = inputs.copy()
-            changed[index] = replacement
-            self.assertNotEqual(original, ci.request_key(*changed))
-        source, public = self.source(), self.public()
-        changed = ci.Candidate(CANDIDATE.source_sha, "e" * 40, CANDIDATE.source_ref, CANDIDATE.slot)
-        self.assertEqual(self.reconcile(source, public, candidate=changed, recent=[run()]), "dispatched")
-        self.assertEqual(source.writes[-1][1]["state"], "pending")
-
-    def test_existing_status_pointer_works_outside_bounded_recent_history(self):
-        source, public = self.source(), self.public()
-        previous = dict(description=f"request:{key()} running", target_url=run()["html_url"])
-        self.assertEqual(self.reconcile(source, public, previous=previous), "passed")
-
-    def test_deleted_run_does_not_preserve_old_green_status(self):
-        source, public = self.source(), self.public()
-        previous = dict(description=f"request:{key()} passed", target_url=run()["html_url"], state="success")
-        with patch.object(public, "api", side_effect=[HTTPError("https://api.github.com/", 404, "Not Found", {}, None), None]):
-            self.assertEqual(self.reconcile(source, public, previous=previous), "dispatched")
-        self.assertEqual(source.writes[-1][1]["state"], "pending")
-
-    def test_dispatch_indexing_gap_is_not_permission_to_duplicate_or_pass(self):
-        source, public = self.source(), self.public()
-        previous = dict(description=f"request:{key()} queued", state="pending", target_url="")
-        self.assertEqual(self.reconcile(source, public, previous=previous), "unresolved")
-        self.assertFalse(public.writes)
-        self.assertFalse(source.writes)
-
-    def test_outdated_full_proof_stays_pending_until_a_scheduled_or_manual_start(self):
-        source, public = self.source(), self.public()
-        self.assertEqual(self.reconcile(source, public, kind="full", eligible=False,
-                                        recent=[run(kind="full", head_sha="e" * 40)]), "scheduled")
-        self.assertEqual(source.writes[-1][1]["state"], "pending")
-        self.assertFalse(public.writes)
-
-    def test_foreign_branch_workflow_and_repository_cannot_supply_proof(self):
-        for change in [dict(head_sha="f" * 40), dict(head_branch="feature"), dict(event="pull_request"),
-                       dict(path=".github/workflows/self-test.yml"),
-                       dict(head_repository=dict(full_name="someone/fork")),
-                       dict(repository=dict(full_name="someone/fork"))]:
-            with self.subTest(change=change):
-                self.assertEqual(self.reconcile(self.source(), self.public(), recent=[run(**change)]), "dispatched")
-
-    def test_status_writes_are_idempotent(self):
+    def test_snapshot_is_frozen_without_current_branch_or_pr_discovery(self):
         source = self.source()
-        previous = dict(context="ci/public-quick", state="success", description=f"request:{key()} passed",
-                        target_url=run()["html_url"])
-        self.assertEqual(self.reconcile(source, self.public(), previous=previous), "passed")
-        self.assertFalse(source.writes)
+        self.assertEqual(ci.load_snapshot(source,NODE,"quick",CANDIDATE.slot,PIPELINE,RECIPIENT),(CANDIDATE,key()))
+        draft = node(description=f"control:{CANDIDATE.control_sha} slot:{CANDIDATE.slot} queued",
+                     creator=dict(login="github-actions[bot]"))
+        source.nodes[NODE] = draft
+        self.assertEqual(ci.load_snapshot(source,NODE,"quick",CANDIDATE.slot,PIPELINE,RECIPIENT,True),(CANDIDATE,None))
+        with self.assertRaises(ValueError):
+            ci.load_snapshot(source,NODE,"quick",CANDIDATE.slot,PIPELINE,RECIPIENT)
 
-    def test_default_branch_and_current_same_repo_prs_exclude_forks_and_duplicate_sha(self):
-        source = FakeAPI(SOURCE, {"commits/development": {"sha": "b" * 40}}, {
-            "pulls?state=open": [dict(head=dict(sha="a" * 40, ref="feature", repo=dict(full_name=SOURCE))),
-                                dict(head=dict(sha="d" * 40, ref="fork", repo=dict(full_name="someone/fork"))),
-                                dict(head=dict(sha="a" * 40, ref="duplicate", repo=dict(full_name=SOURCE)))]})
-        candidates = ci.discover(source, "development")
-        self.assertEqual([candidate.source_sha for candidate in candidates], ["b" * 40, "a" * 40])
-        self.assertTrue(all(candidate.control_sha == "b" * 40 for candidate in candidates))
+    def test_foreign_wrong_kind_author_or_revision_cannot_supply_private_snapshot(self):
+        invalid = [node(__typename="Commit"),node(id="SC_another"),node(context="ci/public-full"),
+                   node(creator=dict(login="stranger")),node(description=status()["description"].replace("b"*40,"e"*40)),
+                   node(commit=dict(oid=CANDIDATE.source_sha,repository=dict(nameWithOwner="other/repo",isPrivate=True))),
+                   node(commit=dict(oid=CANDIDATE.source_sha,repository=dict(nameWithOwner=SOURCE,isPrivate=False)))]
+        for value in invalid:
+            with self.subTest(value=value),self.assertRaises(ValueError):
+                ci.load_snapshot(self.source(nodes={NODE:value}),NODE,"quick",CANDIDATE.slot,PIPELINE,RECIPIENT)
 
-    def test_source_discovery_paginates_and_does_not_silently_truncate(self):
-        github = ci.GitHub(SOURCE, "test-token")
-        with patch.object(github, "api", side_effect=[list(range(100)), [100]]):
-            self.assertEqual(len(list(github.pages("pulls?state=open"))), 101)
-        with patch.object(github, "api", return_value=list(range(100))):
-            with self.assertRaisesRegex(RuntimeError, "pagination"):
-                list(github.pages("pulls?state=open", limit=1))
+    def test_foreign_workflow_branch_or_repository_cannot_finish(self):
+        for changes in [dict(head_branch="feature"),dict(event="pull_request"),dict(path=".github/workflows/self-test.yml"),
+                        dict(head_repository=dict(full_name="other/fork")),dict(repository=dict(full_name="other/fork"))]:
+            source = self.source([status()])
+            with self.subTest(changes=changes),self.assertRaises(ValueError):
+                ci.finish(source,self.public(),run(**changes),RECIPIENT)
+            self.assertFalse(source.writes)
 
-    def test_credential_bearing_commands_reject_feature_refs(self):
-        with patch.dict(os.environ, {"GITHUB_REF": "refs/heads/feature"}):
-            with self.assertRaises(RuntimeError):
-                ci.require_main()
+    def test_route_serializes_branch_requests_and_their_completion_together(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            event,output=Path(temporary)/"event.json",Path(temporary)/"output"
+            values=dict(GITHUB_EVENT_PATH=str(event),GITHUB_OUTPUT=str(output),CI_DEFAULT_SLOT=CANDIDATE.slot)
+            for name,payload in [("workflow_dispatch",dict(inputs=dict(kind="quick",slot=CANDIDATE.slot))),
+                                  ("workflow_run",dict(workflow_run=run()))]:
+                event.write_text(json.dumps(payload));output.write_text("")
+                with patch.dict(os.environ,dict(values,GITHUB_EVENT_NAME=name)):
+                    ci.route()
+                self.assertIn("group=quick-"+CANDIDATE.slot,output.read_text())
+                self.assertIn("run_id="+("17" if name=="workflow_run" else ""),output.read_text())
 
-    def test_superseded_controller_does_not_publish_stale_private_statuses(self):
-        values = dict(GITHUB_REF="refs/heads/main", GITHUB_SHA=PIPELINE, GITHUB_REPOSITORY=PUBLIC,
-                      CI_SOURCE_REPOSITORY=SOURCE, CI_SOURCE_TOKEN="source-token", GH_TOKEN="public-token",
-                      REPORT_RECIPIENT=RECIPIENT)
-        with patch.dict(os.environ, values), patch.object(ci.GitHub, "api", return_value={"object": {"sha": "d" * 40}}) as api:
-            with self.assertRaisesRegex(RuntimeError, "superseded"):
+    def test_surviving_completion_converges_latest_quick_head_without_repeating_full(self):
+        latest = ci.Candidate("f"*40,"b"*40,"f"*40,CANDIDATE.slot)
+        values=dict(GITHUB_REF="refs/heads/main",GITHUB_SHA=PIPELINE,GITHUB_REPOSITORY=PUBLIC,
+                    GITHUB_EVENT_NAME="workflow_run",CI_SOURCE_REPOSITORY=SOURCE,CI_SOURCE_TOKEN="source-token",
+                    GH_TOKEN="public-token",REPORT_RECIPIENT=RECIPIENT,CI_SELECTED_SLOT=CANDIDATE.slot,
+                    CI_COMPLETED_RUN_ID="17")
+        source, public=self.source([status()]), self.public()
+        public.responses["git/ref/heads/main"]=dict(object=dict(sha=PIPELINE))
+        for kind in ["quick","full"]:
+            with patch.dict(os.environ,dict(values,CI_SELECTED_KIND=kind)), \
+                    patch.object(ci,"GitHub",side_effect=[source,public]), \
+                    patch.object(ci,"finish",return_value="passed"), \
+                    patch.object(ci,"current_candidate",return_value=latest), \
+                    patch.object(ci,"dispatch_request",return_value="dispatched") as dispatch, \
+                    contextlib.redirect_stdout(io.StringIO()):
                 ci.controller()
-        self.assertEqual(api.call_args.args, ("GET", "git/ref/heads/main"))
+                self.assertEqual(dispatch.call_count,1 if kind=="quick" else 0)
+                if kind=="quick":self.assertEqual(dispatch.call_args.args[2],latest)
+
+    def test_pagination_is_complete_or_explicitly_fails(self):
+        github=ci.GitHub(SOURCE,"test-token")
+        with patch.object(github,"api",side_effect=[list(range(100)),[100]]):
+            self.assertEqual(len(list(github.pages("commits/x/statuses"))),101)
+        with patch.object(github,"api",return_value=list(range(100))):
+            with self.assertRaisesRegex(RuntimeError,"pagination"):
+                list(github.pages("commits/x/statuses",limit=1))
+
+    def test_credentials_reject_feature_ref_and_superseded_pipeline(self):
+        with patch.dict(os.environ,dict(GITHUB_REF="refs/heads/feature")):
+            with self.assertRaises(RuntimeError):ci.require_main()
+        values=dict(GITHUB_REF="refs/heads/main",GITHUB_SHA=PIPELINE,GITHUB_REPOSITORY=PUBLIC,
+                    CI_SOURCE_REPOSITORY=SOURCE,CI_SOURCE_TOKEN="source-token",GH_TOKEN="public-token",REPORT_RECIPIENT=RECIPIENT)
+        with patch.dict(os.environ,values),patch.object(ci.GitHub,"api",return_value=dict(object=dict(sha="e"*40))):
+            with self.assertRaisesRegex(RuntimeError,"superseded"):ci.controller()
 
 
 class ExecutionTests(unittest.TestCase):
@@ -264,14 +307,14 @@ class ExecutionTests(unittest.TestCase):
         self.assertEqual(list((root / "evidence").iterdir()), [])
         self.assertEqual((root / ".owned").read_text(), "another-execution")
 
-    def test_stale_request_is_rejected_before_any_source_checkout(self):
+    def test_wrong_request_is_rejected_before_any_source_checkout(self):
         ci.prepare(self.root / "ci-private", "17-1")
         values = dict(RUNNER_TEMP=str(self.root), GITHUB_REF="refs/heads/main", GITHUB_SHA=PIPELINE,
                       CI_SOURCE_REPOSITORY=SOURCE, CI_SOURCE_TOKEN="test-token", CI_KIND="quick",
-                      CI_REQUEST="0" * 64, CI_SLOT=CANDIDATE.slot, REPORT_RECIPIENT=RECIPIENT)
-        with patch.dict(os.environ, values), patch.object(ci, "discover", return_value=[CANDIDATE]), \
+                      CI_REQUEST="0" * 64, CI_SLOT=CANDIDATE.slot, CI_STATUS=NODE, REPORT_RECIPIENT=RECIPIENT)
+        with patch.dict(os.environ, values), patch.object(ci, "load_snapshot", return_value=(CANDIDATE,key())), \
                 patch.object(ci, "fetch_commit") as fetch:
-            with self.assertRaisesRegex(RuntimeError, "stale"):
+            with self.assertRaisesRegex(RuntimeError, "does not match"):
                 ci.checkout()
         fetch.assert_not_called()
 
@@ -281,16 +324,41 @@ class ExecutionTests(unittest.TestCase):
         values = dict(RUNNER_TEMP=str(self.root), GITHUB_REF="refs/heads/main", GITHUB_SHA=PIPELINE,
                       GITHUB_RUN_ID="17", GITHUB_RUN_ATTEMPT="1", CI_SOURCE_REPOSITORY=SOURCE,
                       CI_SOURCE_TOKEN="test-token", CI_KIND="quick", CI_REQUEST=key(),
-                      CI_SLOT=CANDIDATE.slot, REPORT_RECIPIENT=RECIPIENT)
+                      CI_SLOT=CANDIDATE.slot, CI_STATUS=NODE, REPORT_RECIPIENT=RECIPIENT)
         def fail(*_args):
             (root / "credentials").mkdir()
             (root / "credentials/key").write_text("credential")
             raise RuntimeError("fetch failed")
-        with patch.dict(os.environ, values), patch.object(ci, "discover", return_value=[CANDIDATE]), \
+        with patch.dict(os.environ, values), patch.object(ci, "load_snapshot", return_value=(CANDIDATE,key())), \
                 patch.object(ci, "fetch_commit", side_effect=fail):
             with self.assertRaises(RuntimeError):
                 ci.checkout()
         self.assertFalse((root / "credentials").exists())
+
+    def test_timeout_stops_descendant_even_when_leader_exits_on_term(self):
+        pidfile = self.root / "child.pid"
+        program = ("import os,signal,time,pathlib; pid=os.fork(); "
+                   "signal.signal(signal.SIGTERM,signal.SIG_IGN) if pid==0 else None; "
+                   f"pathlib.Path({str(pidfile)!r}).write_text(str(os.getpid())) if pid==0 else None; "
+                   "time.sleep(60)")
+        descendant = None
+        try:
+            with self.assertRaises(subprocess.TimeoutExpired):
+                ci.run_private([sys.executable,"-c",program],self.root,self.root/"timeout.log",dict(os.environ),1)
+            descendant = int(pidfile.read_text())
+            rows = subprocess.check_output(["ps","-axo","pid=,stat="],text=True)
+            self.assertFalse(any(int(parts[0])==descendant and not parts[1].startswith("Z")
+                                 for row in rows.splitlines() if len(parts:=row.split())==2))
+        finally:
+            if descendant is None and pidfile.exists():descendant=int(pidfile.read_text())
+            if descendant:
+                try:os.kill(descendant,signal.SIGKILL)
+                except ProcessLookupError:pass
+
+    def test_privileged_account_setup_is_never_allowed_on_a_developer_machine(self):
+        with patch.dict(os.environ,dict(GITHUB_ACTIONS="false")):
+            with self.assertRaisesRegex(RuntimeError,"GitHub-hosted"):
+                isolation.PrivateUser(self.root,["isolation.log"])
 
     def test_cleanup_removes_owned_source_evidence_and_cache_but_preserves_ciphertext(self):
         root = self.root / "ci-private"

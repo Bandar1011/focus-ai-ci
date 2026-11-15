@@ -1,5 +1,5 @@
 name: Private verification
-run-name: '${{ inputs.kind }}:${{ inputs.slot }}:${{ inputs.request }}'
+run-name: '${{ inputs.kind }}:${{ inputs.slot }}:${{ inputs.request }}:${{ inputs.status }}'
 on:
   workflow_dispatch:
     inputs:
@@ -14,6 +14,10 @@ on:
         required: true
       request:
         description: Opaque immutable verification request
+        type: string
+        required: true
+      status:
+        description: Opaque immutable private snapshot
         type: string
         required: true
 permissions:
@@ -49,6 +53,7 @@ jobs:
           CI_KIND: ${{ inputs.kind }}
           CI_REQUEST: ${{ inputs.request }}
           CI_SLOT: ${{ inputs.slot }}
+          CI_STATUS: ${{ inputs.status }}
         run: python3 ci.py checkout
       - name: Run verification with private output
         run: python3 ci.py execute

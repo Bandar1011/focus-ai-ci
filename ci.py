@@ -15,6 +15,7 @@ import subprocess
 import sys
 import tarfile
 import traceback
+from isolation import PrivateUser, run_private
 from urllib.parse import quote, urlencode, urlparse
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
@@ -22,8 +23,11 @@ from urllib.request import Request, urlopen
 
 SHA = re.compile(r"[0-9a-f]{40}\Z")
 REPOSITORY = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\Z")
-TITLE = re.compile(r"(quick|full):([0-9a-f]{16}):([0-9a-f]{64})\Z")
-STATUS_KEY = re.compile(r"request:([0-9a-f]{64}) ([a-z]+)\Z")
+TITLE = re.compile(r"(quick|full):([0-9a-f]{16}):([0-9a-f]{64}):([A-Za-z0-9_=-]{8,256})\Z")
+STATUS_KEY = re.compile(r"request:([0-9a-f]{64}) control:([0-9a-f]{40}) (queued|running|passed|failed|incomplete)\Z")
+SNAPSHOT = re.compile(r"control:([0-9a-f]{40}) slot:([0-9a-f]{16}) queued\Z")
+STATUS_ID = re.compile(r"[A-Za-z0-9_=-]{8,256}\Z")
+SLOT = re.compile(r"[0-9a-f]{16}\Z")
 WORKFLOW = ".github/workflows/verify.yml"
 MAX_PAGES = 20
 
@@ -52,9 +56,9 @@ class GitHub:
         self.repository = repository
         self.token = token
 
-    def api(self, method, path, value=None):
+    def request(self, method, url, value=None):
         body = None if value is None else json.dumps(value).encode()
-        request = Request("https://api.github.com/repos/" + self.repository + "/" + path,
+        request = Request(url,
                           data=body, method=method,
                           headers={"Authorization": "Bearer " + self.token,
                                    "Accept": "application/vnd.github+json",
@@ -64,6 +68,22 @@ class GitHub:
         with urlopen(request, timeout=30) as response:
             raw = response.read()
         return json.loads(raw) if raw else None
+
+    def api(self, method, path, value=None):
+        return self.request(method, "https://api.github.com/repos/" + self.repository + "/" + path, value)
+
+    def status_node(self, node_id):
+        if not STATUS_ID.fullmatch(node_id):
+            raise ValueError("Invalid opaque status identifier.")
+        query = """query($id:ID!){node(id:$id){__typename ... on StatusContext {
+          id context description state targetUrl creator{login}
+          commit{oid repository{nameWithOwner isPrivate}}
+        }}}"""
+        result = self.request("POST", "https://api.github.com/graphql",
+                              dict(query=query, variables=dict(id=node_id)))
+        if result.get("errors") or not result.get("data", {}).get("node"):
+            raise RuntimeError("The private request snapshot is unavailable.")
+        return result["data"]["node"]
 
     def pages(self, path, field=None, limit=MAX_PAGES):
         separator = "&" if "?" in path else "?"
@@ -76,35 +96,40 @@ class GitHub:
         raise RuntimeError("API pagination limit reached; refusing incomplete discovery.")
 
 
-def discover(source, default_ref):
-    if not default_ref or default_ref.startswith("refs/"):
-        raise ValueError("The default source branch must be a branch name.")
-    commit = source.api("GET", "commits/" + quote(default_ref, safe=""))
-    control = commit["sha"]
-    if not SHA.fullmatch(control):
-        raise ValueError("Invalid control commit identity.")
-    ref = "refs/heads/" + default_ref
-    candidates = [Candidate(control, control, ref, slot_key(source.repository, ref))]
-    seen = {control}
-    for pull in source.pages("pulls?state=open"):
-        head = pull["head"]
-        repository = head.get("repo") or {}
-        if repository.get("full_name", "").casefold() != source.repository.casefold():
-            continue
-        sha = head["sha"]
-        if not SHA.fullmatch(sha):
-            raise ValueError("Invalid candidate commit identity.")
-        if sha in seen:
-            continue
-        ref = "refs/heads/" + head["ref"]
-        candidates.append(Candidate(sha, control, ref, slot_key(source.repository, ref)))
-        seen.add(sha)
-    return candidates
+def load_snapshot(source, node_id, kind, slot, pipeline_sha, recipient, allow_draft=False):
+    if kind not in {"quick", "full"} or not SLOT.fullmatch(slot):
+        raise ValueError("Invalid verification kind or opaque branch slot.")
+    node = source.status_node(node_id)
+    commit = node.get("commit") or {}
+    repository = commit.get("repository") or {}
+    creator = (node.get("creator") or {}).get("login", "").casefold()
+    owner_login = source.repository.split("/")[0].casefold()
+    if (node.get("__typename") != "StatusContext" or node.get("id") != node_id
+            or node.get("context") != "ci/public-" + kind
+            or repository.get("nameWithOwner", "").casefold() != source.repository.casefold()
+            or repository.get("isPrivate") is not True or not SHA.fullmatch(commit.get("oid", ""))):
+        raise ValueError("Private request snapshot does not belong to this source and check.")
+    description = node.get("description", "")
+    frozen = STATUS_KEY.fullmatch(description)
+    draft = SNAPSHOT.fullmatch(description) if allow_draft else None
+    if frozen and creator == owner_login:
+        control, key = frozen[2], frozen[1]
+        if key != request_key(kind, commit["oid"], control, pipeline_sha, recipient):
+            raise ValueError("Request does not bind the frozen source, control, pipeline and recipient.")
+    elif draft and creator in {owner_login, "github-actions[bot]"} and draft[2] == slot:
+        control, key = draft[1], None
+    else:
+        raise ValueError("Private request has no trusted immutable snapshot.")
+    return Candidate(commit["oid"], control, commit["oid"], slot), key
 
 
-def latest_statuses(source, sha):
+def latest_statuses(source, sha, final_only=False):
     contexts = {}
     for status in source.pages("commits/" + sha + "/statuses"):
+        if final_only and (not STATUS_KEY.fullmatch(status.get("description", ""))
+                           or (status.get("creator") or {}).get("login", "").casefold()
+                           != source.repository.split("/")[0].casefold()):
+            continue
         context = status["context"]
         if context in {"ci/public-quick", "ci/public-full"} and context not in contexts:
             contexts[context] = status
@@ -130,22 +155,6 @@ def run_id_from_url(url, repository):
     return int(match[1]) if parsed.scheme == "https" and parsed.netloc == "github.com" and match else None
 
 
-def matching_run(public, status, recent, pipeline_sha, key, kind):
-    candidates = [run for run in recent
-                  if trusted_run(run, public.repository, pipeline_sha, key, kind)]
-    run_id = run_id_from_url((status or {}).get("target_url"), public.repository)
-    if run_id is not None:
-        try:
-            known = public.api("GET", "actions/runs/" + str(run_id))
-        except HTTPError as error:
-            if error.code != 404:
-                raise
-            known = None
-        if known and trusted_run(known, public.repository, pipeline_sha, key, kind):
-            candidates.append(known)
-    return max(candidates, key=lambda item: (item["id"], item.get("run_attempt", 1)), default=None)
-
-
 def report_available(public, run, kind, key):
     expected = f"report-{kind}-{key}-attempt-{run.get('run_attempt', 1)}"
     return any(item["name"] == expected and not item["expired"] and item.get("size_in_bytes", 0) > 0
@@ -154,45 +163,115 @@ def report_available(public, run, kind, key):
 
 def publish(source, candidate, kind, key, phase, state, target_url, previous):
     value = dict(context="ci/public-" + kind, state=state,
-                 description=f"request:{key} {phase}", target_url=target_url)
+                 description=f"request:{key} control:{candidate.control_sha} {phase}", target_url=target_url)
     if previous and all(previous.get(name) == content for name, content in value.items()):
-        return
-    source.api("POST", "statuses/" + candidate.source_sha, value)
+        return previous
+    return source.api("POST", "statuses/" + candidate.source_sha, value)
 
 
-def reconcile(source, public, candidate, kind, pipeline_sha, recipient, previous, recent,
-              eligible, force=False):
-    key = request_key(kind, candidate.source_sha, candidate.control_sha, pipeline_sha, recipient)
+def finish(source, public, run, recipient):
+    title = TITLE.fullmatch(run.get("display_title", ""))
+    if not title or not trusted_run(run, public.repository, run.get("head_sha"), title[3], title[1]):
+        raise ValueError("Completion is not a trusted main-branch verification run.")
+    kind, slot, key, node_id = title.groups()
+    candidate, _ = load_snapshot(source, node_id, kind, slot, run["head_sha"], recipient)
+    previous = latest_statuses(source, candidate.source_sha).get("ci/public-" + kind)
     matched = STATUS_KEY.fullmatch((previous or {}).get("description", ""))
-    phase = matched[2] if matched and matched[1] == key else None
-    run = matching_run(public, previous if phase else None, recent, pipeline_sha, key, kind)
-    workflow_url = "https://github.com/" + public.repository + "/actions/workflows/verify.yml"
-    if run and run["status"] != "completed":
-        publish(source, candidate, kind, key, "running", "pending", run["html_url"], previous)
+    if (not matched or matched[1] != key or matched[2] != candidate.control_sha
+            or (previous.get("creator") or {}).get("login", "").casefold()
+            != source.repository.split("/")[0].casefold()
+            or run_id_from_url(previous.get("target_url"), public.repository) != run["id"]):
+        return "superseded"
+    if run["status"] != "completed":
         return "active"
-    if run and not force:
-        conclusion = run.get("conclusion")
-        if conclusion == "success" and report_available(public, run, kind, key):
-            publish(source, candidate, kind, key, "passed", "success", run["html_url"], previous)
-            return "passed"
-        if conclusion != "success":
-            outcome = "failed" if conclusion == "failure" else "incomplete"
-            publish(source, candidate, kind, key, outcome,
-                    "failure" if outcome == "failed" else "error", run["html_url"], previous)
-            return outcome
-    if not force and phase in {"failed", "incomplete"} and not run:
-        return phase
-    if not force and phase in {"queued", "running"} and not run:
-        # An accepted dispatch is not permission to dispatch duplicates while API
-        # indexing is delayed. Missing history never becomes passing evidence.
-        return "unresolved"
-    if not eligible:
-        publish(source, candidate, kind, key, "scheduled", "pending", workflow_url, previous)
-        return "scheduled"
-    public.api("POST", "actions/workflows/verify.yml/dispatches",
-               dict(ref="main", inputs=dict(kind=kind, request=key, slot=candidate.slot)))
-    publish(source, candidate, kind, key, "queued", "pending", workflow_url, previous)
+    if run.get("conclusion") == "success" and report_available(public, run, kind, key):
+        phase, state = "passed", "success"
+    elif run.get("conclusion") == "failure":
+        phase, state = "failed", "failure"
+    else:
+        phase, state = "incomplete", "error"
+    publish(source, candidate, kind, key, phase, state, run["html_url"], previous)
+    return phase
+
+
+def dispatch_request(source, public, candidate, kind, pipeline_sha, recipient, force=False):
+    key = request_key(kind, candidate.source_sha, candidate.control_sha, pipeline_sha, recipient)
+    previous = latest_statuses(source, candidate.source_sha, final_only=True).get("ci/public-" + kind)
+    matched = STATUS_KEY.fullmatch((previous or {}).get("description", ""))
+    phase = matched[3] if matched and matched[1] == key else None
+    workflow_url = "https://github.com/" + public.repository + "/actions/workflows/verify.yml"
+    if phase:
+        run_id = run_id_from_url(previous.get("target_url"), public.repository)
+        if run_id:
+            try:
+                run = public.api("GET", "actions/runs/" + str(run_id))
+            except HTTPError as error:
+                if error.code != 404:
+                    raise
+                run = None
+            if run and trusted_run(run, public.repository, pipeline_sha, key, kind):
+                publish(source, candidate, kind, key, "queued", "pending", run["html_url"], None)
+                if run["status"] != "completed":
+                    return "active"
+                if not force:
+                    return finish(source, public, run, recipient)
+        if not force:
+            publish(source, candidate, kind, key, phase if phase in {"failed", "incomplete"} else "incomplete",
+                    "failure" if phase == "failed" else "error", workflow_url, None)
+            return "incomplete" if phase not in {"failed", "incomplete"} else phase
+    pending = publish(source, candidate, kind, key, "queued", "pending", workflow_url, None)
+    node_id = pending["node_id"]
+    if not STATUS_ID.fullmatch(node_id):
+        raise RuntimeError("Private status has no opaque immutable identity.")
+    try:
+        result = public.api("POST", "actions/workflows/verify.yml/dispatches",
+                            dict(ref="main", return_run_details=True,
+                                 inputs=dict(kind=kind, request=key, slot=candidate.slot, status=node_id)))
+        run_id = result["workflow_run_id"]
+        url = result["html_url"]
+        if type(run_id) is not int or run_id_from_url(url, public.repository) != run_id:
+            raise RuntimeError("Dispatch did not return a valid exact worker identity.")
+        publish(source, candidate, kind, key, "queued", "pending", url, pending)
+    except Exception:
+        publish(source, candidate, kind, key, "incomplete", "error", workflow_url, pending)
+        raise
     return "dispatched"
+
+
+def route():
+    event = json.loads(Path(os.environ["GITHUB_EVENT_PATH"]).read_text())
+    event_name = os.environ["GITHUB_EVENT_NAME"]
+    run_id = ""
+    if event_name == "workflow_run":
+        run = event["workflow_run"]
+        title = TITLE.fullmatch(run.get("display_title", ""))
+        if not title or run.get("status") != "completed" or type(run.get("id")) is not int:
+            raise ValueError("Invalid verification completion route.")
+        kind, slot = title[1], title[2]
+        run_id = str(run["id"])
+    else:
+        inputs = event.get("inputs") or {}
+        kind = "full" if event_name == "schedule" else inputs.get("kind", "quick")
+        slot = inputs.get("slot") or os.environ.get("CI_DEFAULT_SLOT", "")
+        if kind not in {"quick", "full"} or not SLOT.fullmatch(slot):
+            raise ValueError("Invalid controller route.")
+    group = "full" if kind == "full" else "quick-" + slot
+    with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+        output.write(f"kind={kind}\nslot={slot}\ngroup={group}\nrun_id={run_id}\n")
+
+
+def current_candidate(source, selected_slot):
+    control = source.api("GET", "commits/development")["sha"]
+    if not SHA.fullmatch(control):
+        raise ValueError("Invalid current control revision.")
+    for branch in source.pages("branches"):
+        ref = "refs/heads/" + branch["name"]
+        if slot_key(source.repository, ref) == selected_slot:
+            sha = branch["commit"]["sha"]
+            if not SHA.fullmatch(sha):
+                raise ValueError("Invalid current source revision.")
+            return Candidate(sha, control, sha, selected_slot)
+    return None
 
 
 def controller():
@@ -205,38 +284,36 @@ def controller():
         raise ValueError("Pipeline identity and report recipient are required.")
     if public.api("GET", "git/ref/heads/main")["object"]["sha"] != pipeline:
         raise RuntimeError("The controller revision is superseded; no stale statuses will be published.")
-    candidates = discover(source, os.environ.get("CI_SOURCE_DEFAULT_REF", "development"))
-    selected_slot = os.environ.get("CI_SELECTED_SLOT", "") or candidates[0].slot
-    selected = next((candidate for candidate in candidates if candidate.slot == selected_slot), None)
-    if selected is None:
-        raise ValueError("Requested candidate is no longer current.")
-    manual = os.environ.get("CI_MANUAL", "false") == "true"
+    run_id = os.environ.get("CI_COMPLETED_RUN_ID", "")
+    selected_slot = os.environ["CI_SELECTED_SLOT"]
     kind = os.environ.get("CI_SELECTED_KIND", "quick")
-    if kind not in {"quick", "full"}:
-        raise ValueError("Unsupported verification kind.")
-    full_due = os.environ.get("CI_FULL_DUE", "false") == "true"
-    force = manual and os.environ.get("CI_FORCE", "false") == "true"
-    recent = []
-    # This bounded scan bridges a dispatch's 204 response to its first run ID.
-    # Established status target URLs are read directly, independent of this window.
-    for page in range(1, 4):
-        rows = public.api("GET", f"actions/workflows/verify.yml/runs?per_page=100&page={page}")["workflow_runs"]
-        recent.extend(rows)
-        if len(rows) < 100:
-            break
-    counts = {}
-    for candidate in candidates:
-        statuses = latest_statuses(source, candidate.source_sha)
-        for check in ["quick", "full"]:
-            previous = statuses.get("ci/public-" + check)
-            is_selected = manual and candidate == selected and check == kind
-            if check == "full" and candidate != candidates[0] and not previous and not is_selected:
-                continue
-            eligible = check == "quick" or (candidate == candidates[0] and full_due) or is_selected
-            result = reconcile(source, public, candidate, check, pipeline, recipient,
-                               previous, recent, eligible, force and is_selected)
-            counts[result] = counts.get(result, 0) + 1
-    print(json.dumps(counts, sort_keys=True))
+    if kind not in {"quick", "full"} or not SLOT.fullmatch(selected_slot):
+        raise ValueError("Unsupported verification kind or branch slot.")
+    if run_id:
+        if not run_id.isdecimal():
+            raise ValueError("Invalid completed worker identity.")
+        result = finish(source, public, public.api("GET", "actions/runs/" + run_id), recipient)
+        # GitHub retains only one pending controller per branch. A completion
+        # may replace a pending push, so converge the surviving actor on the
+        # current Quick head. Unchanged failures never trigger another worker.
+        if kind == "quick" and (current := current_candidate(source, selected_slot)):
+            result = dispatch_request(source, public, current, kind, pipeline, recipient)
+        print(json.dumps(dict(result=result)))
+        return
+    node_id = os.environ.get("CI_REQUEST_STATUS", "")
+    if node_id:
+        candidate, _ = load_snapshot(source, node_id, kind, selected_slot, pipeline, recipient, allow_draft=True)
+    else:
+        default_ref = os.environ.get("CI_SOURCE_DEFAULT_REF", "development")
+        commit = source.api("GET", "commits/" + quote(default_ref, safe=""))["sha"]
+        if not SHA.fullmatch(commit) or selected_slot != slot_key(source.repository, "refs/heads/" + default_ref):
+            raise ValueError("Default branch routing does not match the private source.")
+        candidate = Candidate(commit, commit, commit, selected_slot)
+    force = os.environ.get("GITHUB_EVENT_NAME") == "workflow_dispatch" and os.environ.get("CI_FORCE") == "true"
+    result = dispatch_request(source, public, candidate, kind, pipeline, recipient, force)
+    if kind == "quick" and (current := current_candidate(source, selected_slot)) and current != candidate:
+        result = dispatch_request(source, public, current, kind, pipeline, recipient)
+    print(json.dumps(dict(result=result)))
 
 
 def require_main():
@@ -320,17 +397,15 @@ def checkout():
     root = private_root()
     source = GitHub(os.environ["CI_SOURCE_REPOSITORY"], os.environ["CI_SOURCE_TOKEN"])
     kind, request, slot = (os.environ[name] for name in ["CI_KIND", "CI_REQUEST", "CI_SLOT"])
-    if kind not in {"quick", "full"} or not re.fullmatch(r"[0-9a-f]{64}", request):
+    node_id = os.environ["CI_STATUS"]
+    if kind not in {"quick", "full"} or not re.fullmatch(r"[0-9a-f]{64}", request) or not SLOT.fullmatch(slot):
         raise ValueError("Invalid verification request.")
     pipeline = os.environ["GITHUB_SHA"]
     recipient = os.environ["REPORT_RECIPIENT"].strip()
-    candidates = discover(source, os.environ.get("CI_SOURCE_DEFAULT_REF", "development"))
-    candidate = next((candidate for candidate in candidates
-                      if candidate.slot == slot and request == request_key(
-                          kind, candidate.source_sha, candidate.control_sha, pipeline, recipient)), None)
-    if candidate is None:
-        raise RuntimeError("The immutable request is stale; no newer source will be substituted.")
-    receipt = dict(schema=1, kind=kind, request=request, slot=slot,
+    candidate, expected = load_snapshot(source, node_id, kind, slot, pipeline, recipient)
+    if request != expected:
+        raise RuntimeError("The immutable request does not match the private status snapshot.")
+    receipt = dict(schema=1, kind=kind, request=request, slot=slot, status_id=node_id,
                    source_sha=candidate.source_sha, control_sha=candidate.control_sha,
                    source_ref=candidate.source_ref, pipeline_sha=pipeline,
                    recipient_sha256=hashlib.sha256(recipient.encode()).hexdigest(),
@@ -352,35 +427,14 @@ def checkout():
 
 
 def execution_environment(evidence):
-    env = {key: value for key, value in os.environ.items()
-           if not key.startswith(("ACTIONS_", "CI_SOURCE_", "CI_REQUEST", "CI_SLOT"))
-           and key not in {"GH_TOKEN", "GITHUB_TOKEN", "REPORT_RECIPIENT", "GIT_ASKPASS"}
-           and not key.startswith("GIT_CONFIG_")}
+    allowed = {"PATH", "LANG", "LC_ALL", "CI", "GITHUB_ACTIONS", "RUNNER_OS", "RUNNER_ARCH",
+               "GITHUB_RUN_ID", "GITHUB_RUN_ATTEMPT", "GITHUB_SHA", "GITHUB_REPOSITORY"}
+    env = {key: value for key, value in os.environ.items() if key in allowed}
+    env.setdefault("PATH", os.defpath)
     for name in ["GITHUB_OUTPUT", "GITHUB_ENV", "GITHUB_PATH", "GITHUB_STATE", "GITHUB_STEP_SUMMARY"]:
         env[name] = str(evidence / (name.lower() + ".txt"))
     env["PYTHONDONTWRITEBYTECODE"] = "1"
     return env
-
-
-def run_private(command, cwd, log, env, timeout):
-    with log.open("ab") as output:
-        child = subprocess.Popen(command, cwd=cwd, env=env, stdout=output,
-                                 stderr=subprocess.STDOUT, start_new_session=True)
-        try:
-            result = child.wait(timeout=timeout)
-        except BaseException:
-            try:
-                os.killpg(child.pid, signal.SIGTERM)
-                child.wait(timeout=10)
-            except (ProcessLookupError, subprocess.TimeoutExpired):
-                try:
-                    os.killpg(child.pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
-                child.wait()
-            raise
-    if result:
-        raise RuntimeError("Private verification command failed.")
 
 
 def execute():
@@ -390,9 +444,8 @@ def execute():
     paths = json.loads((root / "execution.json").read_text())
     source, control = Path(paths["source"]), Path(paths["control"])
     env = execution_environment(evidence)
+    workflow_files = list((source / ".github/workflows").glob("*.y*ml"))
     if receipt["kind"] == "quick":
-        if list((source / ".github/workflows").glob("*.y*ml")):
-            run_private(["actionlint", "-color"], source, evidence / "actionlint.log", env, 120)
         command = [sys.executable, str(control / "scripts/ci.py"), "quick", "--source", str(source),
                    "--output", str(evidence / "checks")]
         timeout = 600
@@ -403,7 +456,11 @@ def execute():
         command = [sys.executable, str(control / "scripts/ci_native.py"), "--source", str(source),
                    "--cache", str(root / "native-cache"), "--output", str(evidence / "checks")]
         timeout = 3000
-    run_private(command, source, evidence / "execution.log", env, timeout)
+    with PrivateUser(root, ["isolation.log", "actionlint.log", "execution.log"]) as isolated:
+        isolated.probe(env)
+        if receipt["kind"] == "quick" and workflow_files:
+            isolated.run(["actionlint", "-color"], source, "actionlint.log", env, 120)
+        isolated.run(command, source, "execution.log", env, timeout)
     receipt["status"] = "passed"
     write_json(evidence / "receipt.json", receipt)
 
@@ -434,8 +491,15 @@ def seal(evidence, destination, recipient, age="age"):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=["controller", "checkout", "execute", "seal", "cleanup"])
+    parser.add_argument("command", choices=["route", "controller", "checkout", "execute", "seal", "cleanup"])
     args = parser.parse_args()
+    if args.command == "route":
+        try:
+            route()
+            return 0
+        except (KeyError, ValueError, OSError):
+            print("Invalid CI event route.", file=sys.stderr)
+            return 1
     root = private_root()
     try:
         if args.command == "cleanup":
@@ -448,7 +512,7 @@ def main():
         else:
             {"controller": controller, "checkout": checkout, "execute": execute}[args.command]()
         return 0
-    except Exception:
+    except (Exception, KeyboardInterrupt):
         # Diagnostics must never create a second public exception or write into
         # another execution's workspace, including failures during preparation.
         try:
@@ -467,4 +531,7 @@ def main():
 
 
 if __name__ == "__main__":
+    def cancelled(_signal, _frame):
+        raise KeyboardInterrupt("CI operation cancelled")
+    signal.signal(signal.SIGTERM, cancelled)
     raise SystemExit(main())
