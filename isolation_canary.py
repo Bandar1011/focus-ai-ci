@@ -18,19 +18,20 @@ def run(*args):
 inventory = json.loads(subprocess.check_output(['xcrun','simctl','list','devices','available','--json']))['devices']
 devices = [d for runtime, group in inventory.items() if runtime.endswith('iOS-27-0') for d in group]
 assert devices and all(d['state'] == 'Shutdown' for d in devices)
-device = devices[0]['udid']
-profile = root / 'simslim.json'
-profile.write_text(json.dumps({'name':'public-canary','except':['widgets','store'],'keep':[]}))
+device = subprocess.check_output(['xcrun','simctl','create','CI Native Canary',
+    'com.apple.CoreSimulator.SimDeviceType.iPhone-17',
+    'com.apple.CoreSimulator.SimRuntime.iOS-27-0'], text=True).strip()
 try:
-    run('simslim','on',device,'--profile',str(profile))
-    run('simslim','verify',device,'--profile',str(profile))
-    run('xcrun','simctl','bootstatus',device,'-b')
     run('xcodegen','generate')
     command = ['xcodebuild','-project','Canary.xcodeproj','-scheme','Canary','-configuration','Debug',
-               '-destination','platform=iOS Simulator,id='+device,'-derivedDataPath',str(root/'build'),
+               '-destination','generic/platform=iOS Simulator','-derivedDataPath',str(root/'build'),
                '-jobs','2','-parallel-testing-enabled','NO','COMPILER_INDEX_STORE_ENABLE=NO',
                'CODE_SIGNING_ALLOWED=NO']
+    command += ['ARCHS='+__import__('platform').machine(), 'ONLY_ACTIVE_ARCH=YES']
     run(*command, 'build-for-testing')
+    run('xcrun','simctl','boot',device)
+    run('xcrun','simctl','bootstatus',device,'-b')
+    command[command.index('-destination')+1] = 'platform=iOS Simulator,id='+device
     command += ['test-without-building']
     process = subprocess.Popen(command)
     saw_service = saw_app = saw_tests = False
@@ -51,7 +52,10 @@ try:
     assert process.returncode == 0
     assert saw_service and saw_app and saw_tests, 'Required native process UID evidence is missing'
 finally:
-    run('xcrun','simctl','shutdown',device)
+    state = json.loads(subprocess.check_output(['xcrun','simctl','list','devices','--json']))['devices']
+    current = next(d for group in state.values() for d in group if d['udid']==device)
+    if current['state'] != 'Shutdown': run('xcrun','simctl','shutdown',device)
+    run('xcrun','simctl','delete',device)
 print('native-uid-canary-ok')
 '''
 
