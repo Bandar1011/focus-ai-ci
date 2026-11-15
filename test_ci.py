@@ -38,7 +38,7 @@ def status(kind="quick", phase="queued", candidate=CANDIDATE, url=None):
 
 def node(kind="quick", **changes):
     value = dict(__typename="StatusContext", id=NODE, context="ci/public-"+kind,
-                 description=status(kind)["description"], creator=dict(login="owner"),
+                 description=status(kind)["description"], creator=dict(login="owner",__typename="User"),
                  commit=dict(oid=CANDIDATE.source_sha, repository=dict(nameWithOwner=SOURCE, isPrivate=True)))
     value.update(changes)
     return value
@@ -171,11 +171,24 @@ class ControllerTests(unittest.TestCase):
         source = self.source()
         self.assertEqual(ci.load_snapshot(source,NODE,"quick",CANDIDATE.slot,PIPELINE,RECIPIENT),(CANDIDATE,key()))
         draft = node(description=f"control:{CANDIDATE.control_sha} slot:{CANDIDATE.slot} queued",
-                     creator=dict(login="github-actions[bot]"))
+                     creator=dict(login="github-actions",__typename="Bot",databaseId=41898282))
         source.nodes[NODE] = draft
         self.assertEqual(ci.load_snapshot(source,NODE,"quick",CANDIDATE.slot,PIPELINE,RECIPIENT,True),(CANDIDATE,None))
         with self.assertRaises(ValueError):
             ci.load_snapshot(source,NODE,"quick",CANDIDATE.slot,PIPELINE,RECIPIENT)
+
+    def test_snapshot_rejects_lookalike_users_other_bots_and_bot_frozen_requests(self):
+        draft = f"control:{CANDIDATE.control_sha} slot:{CANDIDATE.slot} queued"
+        for creator in [dict(login="github-actions",__typename="User",databaseId=41898282),
+                        dict(login="github-actions",__typename="Bot",databaseId=42),
+                        dict(login="github-actions[bot]"), dict(login="owner",__typename="Bot",databaseId=42)]:
+            for description in [draft,status()["description"]]:
+                source = self.source(nodes={NODE:node(creator=creator,description=description)})
+                with self.subTest(creator=creator,description=description),self.assertRaises(ValueError):
+                    ci.load_snapshot(source,NODE,"quick",CANDIDATE.slot,PIPELINE,RECIPIENT,True)
+        source = self.source(nodes={NODE:node(creator=dict(login="github-actions",__typename="Bot",databaseId=41898282))})
+        with self.assertRaises(ValueError):
+            ci.load_snapshot(source,NODE,"quick",CANDIDATE.slot,PIPELINE,RECIPIENT,True)
 
     def test_foreign_wrong_kind_author_or_revision_cannot_supply_private_snapshot(self):
         invalid = [node(__typename="Commit"),node(id="SC_another"),node(context="ci/public-full"),
