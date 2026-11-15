@@ -540,5 +540,20 @@ class EvidenceBoundaryTests(unittest.TestCase):
         self.assertEqual(original.read_text(),"keep this")
 
 
+class PublicToolTests(unittest.TestCase):
+    def test_native_runner_installs_no_simslim(self):
+        import install_tools
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with patch.dict(os.environ, dict(RUNNER_TEMP=str(root), GITHUB_PATH=str(root/'path'), CI_NATIVE_TOOLS='true')), \
+                 patch.object(install_tools.platform, 'system', return_value='Darwin'), \
+                 patch.object(install_tools.platform, 'machine', return_value='arm64'), \
+                 patch.object(install_tools, 'install') as download, patch.object(install_tools.subprocess, 'run') as command:
+                install_tools.main()
+            members = {member for call in download.call_args_list for member in call.args[2]}
+            self.assertEqual(members, {'age/age', 'age/age-keygen', 'actionlint'})
+            command.assert_called_once_with(['brew', 'install', 'xcodegen'], check=True)
+
+
 if __name__ == "__main__":
     unittest.main()

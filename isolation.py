@@ -183,7 +183,7 @@ class PrivateUser:
                     path.chmod(0o700)
             self.sudo("mkdir", self.home / "tools", self.home / "tmp")
             # XcodeGen needs the presets beside its installed executable.
-            for name in ["actionlint", "simslim"]:
+            for name in ["actionlint"]:
                 executable = shutil.which(name)
                 if executable:
                     self.sudo("cp", str(Path(executable).resolve()), self.home / "tools" / name)
