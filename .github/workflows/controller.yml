@@ -56,7 +56,6 @@ jobs:
     timeout-minutes: 5
     permissions:
       contents: read
-      actions: write
     concurrency:
       group: controller-${{ needs.route.outputs.group }}
       cancel-in-progress: false
@@ -70,7 +69,8 @@ jobs:
         run: python3 install_tools.py
       - name: Request verification or reconcile its completion
         env:
-          GH_TOKEN: ${{ github.token }}
+          # A job-token dispatch suppresses the worker's workflow_run callback.
+          GH_TOKEN: ${{ secrets.CI_DISPATCH_TOKEN }}
           CI_SOURCE_REPOSITORY: ${{ secrets.CI_SOURCE_REPOSITORY }}
           CI_SOURCE_TOKEN: ${{ secrets.CI_SOURCE_TOKEN }}
           CI_SOURCE_DEFAULT_REF: development
