@@ -31,20 +31,9 @@ on:
 permissions:
   contents: read
 jobs:
-  runner-probe:
-    if: github.event_name == 'workflow_dispatch' && github.ref != 'refs/heads/main'
-    strategy:
-      fail-fast: false
-      matrix:
-        runner: [ubuntu-24.04, ubuntu-slim]
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 1
-    steps:
-      - name: Confirm runner allocation
-        run: printf 'Runner allocation succeeded\n'
   route:
     if: github.ref == 'refs/heads/main'
-    runs-on: ubuntu-slim
+    runs-on: ubuntu-24.04
     timeout-minutes: 2
     outputs:
       kind: ${{ steps.route.outputs.kind }}
@@ -63,7 +52,7 @@ jobs:
   controller:
     needs: route
     environment: ci
-    runs-on: ubuntu-slim
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions:
       contents: read
