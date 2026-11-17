@@ -33,7 +33,7 @@ permissions:
 jobs:
   route:
     if: github.ref == 'refs/heads/main'
-    runs-on: ubuntu-slim
+    runs-on: ubuntu-24.04
     timeout-minutes: 2
     outputs:
       kind: ${{ steps.route.outputs.kind }}
@@ -52,7 +52,7 @@ jobs:
   controller:
     needs: route
     environment: ci
-    runs-on: ubuntu-slim
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions:
       contents: read
