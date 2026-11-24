@@ -117,6 +117,70 @@ class ControllerTests(unittest.TestCase):
         self.assertFalse(public.writes)
         self.assertEqual(source.writes[-1][1]["target_url"],run()["html_url"])
 
+    def test_completion_reconciliation_never_requeues_a_completed_worker_with_stale_reads(self):
+        source, public = self.source([status()]), self.public()
+        public.responses["git/ref/heads/main"] = dict(object=dict(sha=PIPELINE))
+        passed = dict(status(phase="passed"), state="success")
+        reads = iter([[status()], [passed], [passed]])
+        values = dict(GITHUB_REF="refs/heads/main", GITHUB_SHA=PIPELINE, GITHUB_REPOSITORY=PUBLIC,
+                      CI_SOURCE_REPOSITORY=SOURCE, CI_SOURCE_TOKEN="source-token", GH_TOKEN="public-token",
+                      REPORT_RECIPIENT=RECIPIENT, CI_SELECTED_SLOT=CANDIDATE.slot,
+                      CI_SELECTED_KIND="quick", CI_COMPLETED_RUN_ID="17")
+        # GitHub can return the earlier success after a later status write.
+        with patch.dict(os.environ, values), patch.object(ci, "GitHub", side_effect=[source, public]), \
+                patch.object(ci, "current_candidate", return_value=CANDIDATE), \
+                patch.object(source, "pages", side_effect=lambda *args: iter(next(reads))), \
+                contextlib.redirect_stdout(io.StringIO()):
+            ci.controller()
+        self.assertEqual([value["state"] for _, value in source.writes], ["success"])
+        self.assertEqual(source.rows["commits/" + CANDIDATE.source_sha + "/statuses"][0]["state"], "success")
+        self.assertFalse(public.writes)
+
+    def test_completed_worker_finishes_a_matching_alias_without_requeueing(self):
+        alias_id = "SC_actions_alias"
+        description = f"control:{CANDIDATE.control_sha} slot:{CANDIDATE.slot} queued"
+        alias = dict(node_id=alias_id, context="ci/public-quick", state="pending", description=description,
+                     creator=dict(login="github-actions[bot]"))
+        source = self.source([alias, status()])
+        source.nodes[alias_id] = node(id=alias_id, description=description,
+            creator=dict(login="github-actions[bot]", __typename="Bot", databaseId=ci.GITHUB_ACTIONS_BOT_ID))
+        public = self.public()
+        self.assertEqual(self.dispatch(source, public), "passed")
+        self.assertEqual([value["state"] for _, value in source.writes], ["success"])
+        self.assertFalse(public.writes)
+
+    def test_duplicate_draft_preserves_the_latest_forced_worker_and_its_result(self):
+        alias_id = "SC_actions_alias"
+        description = f"control:{CANDIDATE.control_sha} slot:{CANDIDATE.slot} queued"
+        alias = dict(node_id=alias_id, context="ci/public-quick", state="pending", description=description,
+                     creator=dict(login="github-actions[bot]"))
+        new_url = f"https://github.com/{PUBLIC}/actions/runs/18"
+        for conclusion, result, state in [("failure", "failed", "failure"), ("success", "incomplete", "error")]:
+            with self.subTest(conclusion=conclusion):
+                source = self.source([alias, status(url=new_url), status()])
+                source.nodes[alias_id] = node(id=alias_id, description=description,
+                    creator=dict(login="github-actions[bot]", __typename="Bot", databaseId=ci.GITHUB_ACTIONS_BOT_ID))
+                public = self.public()  # Only the older worker has encrypted proof.
+                self.assertEqual(ci.finish(source, public, run(), RECIPIENT), "superseded")
+                self.assertFalse(source.writes)
+                newer = run(id=18, html_url=new_url, conclusion=conclusion)
+                self.assertEqual(ci.finish(source, public, newer, RECIPIENT), result)
+                self.assertEqual(source.writes[-1][1]["state"], state)
+                self.assertEqual(source.writes[-1][1]["target_url"], new_url)
+                self.assertNotIn("success", [value["state"] for _, value in source.writes])
+
+    def test_completion_rejects_untrusted_or_different_control_aliases(self):
+        alias_id = "SC_actions_alias"
+        for creator, control in [(dict(login="github-actions[bot]", __typename="Bot", databaseId=1), CANDIDATE.control_sha),
+                                 (dict(login="github-actions[bot]", __typename="Bot", databaseId=ci.GITHUB_ACTIONS_BOT_ID), "e" * 40)]:
+            description = f"control:{control} slot:{CANDIDATE.slot} queued"
+            alias = dict(node_id=alias_id, context="ci/public-quick", state="pending", description=description,
+                         creator=dict(login="github-actions[bot]"))
+            source = self.source([alias, status()])
+            source.nodes[alias_id] = node(id=alias_id, description=description, creator=creator)
+            self.assertEqual(ci.finish(source, self.public(), run(), RECIPIENT), "superseded")
+            self.assertFalse(source.writes)
+
     def test_success_requires_whole_run_and_current_attempt_nonexpired_ciphertext(self):
         for artifact, conclusion, attempt, expected in [(True,"success",1,"passed"),
                 (False,"success",1,"incomplete"),(True,"failure",1,"failed"),
