@@ -180,6 +180,7 @@ def finish(source, public, run, recipient):
     kind, slot, key, node_id = title.groups()
     candidate, _ = load_snapshot(source, node_id, kind, slot, run["head_sha"], recipient)
     previous = latest_statuses(source, candidate.source_sha).get("ci/public-" + kind)
+    worker_status = previous
     matched = STATUS_KEY.fullmatch((previous or {}).get("description", ""))
     if not matched:
         try:
@@ -189,10 +190,12 @@ def finish(source, public, run, recipient):
             return "superseded"
         if alias_key is not None or alias != candidate:
             return "superseded"
-    elif (matched[1] != key or matched[2] != candidate.control_sha
-            or (previous.get("creator") or {}).get("login", "").casefold()
+        worker_status = latest_statuses(source, candidate.source_sha, final_only=True).get("ci/public-" + kind)
+        matched = STATUS_KEY.fullmatch((worker_status or {}).get("description", ""))
+    if (not matched or matched[1] != key or matched[2] != candidate.control_sha
+            or (worker_status.get("creator") or {}).get("login", "").casefold()
             != source.repository.split("/")[0].casefold()
-            or run_id_from_url(previous.get("target_url"), public.repository) != run["id"]):
+            or run_id_from_url(worker_status.get("target_url"), public.repository) != run["id"]):
         return "superseded"
     if run["status"] != "completed":
         return "active"

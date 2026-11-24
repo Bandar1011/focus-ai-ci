@@ -149,6 +149,26 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual([value["state"] for _, value in source.writes], ["success"])
         self.assertFalse(public.writes)
 
+    def test_duplicate_draft_preserves_the_latest_forced_worker_and_its_result(self):
+        alias_id = "SC_actions_alias"
+        description = f"control:{CANDIDATE.control_sha} slot:{CANDIDATE.slot} queued"
+        alias = dict(node_id=alias_id, context="ci/public-quick", state="pending", description=description,
+                     creator=dict(login="github-actions[bot]"))
+        new_url = f"https://github.com/{PUBLIC}/actions/runs/18"
+        for conclusion, result, state in [("failure", "failed", "failure"), ("success", "incomplete", "error")]:
+            with self.subTest(conclusion=conclusion):
+                source = self.source([alias, status(url=new_url), status()])
+                source.nodes[alias_id] = node(id=alias_id, description=description,
+                    creator=dict(login="github-actions[bot]", __typename="Bot", databaseId=ci.GITHUB_ACTIONS_BOT_ID))
+                public = self.public()  # Only the older worker has encrypted proof.
+                self.assertEqual(ci.finish(source, public, run(), RECIPIENT), "superseded")
+                self.assertFalse(source.writes)
+                newer = run(id=18, html_url=new_url, conclusion=conclusion)
+                self.assertEqual(ci.finish(source, public, newer, RECIPIENT), result)
+                self.assertEqual(source.writes[-1][1]["state"], state)
+                self.assertEqual(source.writes[-1][1]["target_url"], new_url)
+                self.assertNotIn("success", [value["state"] for _, value in source.writes])
+
     def test_completion_rejects_untrusted_or_different_control_aliases(self):
         alias_id = "SC_actions_alias"
         for creator, control in [(dict(login="github-actions[bot]", __typename="Bot", databaseId=1), CANDIDATE.control_sha),
