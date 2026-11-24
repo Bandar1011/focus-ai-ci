@@ -181,7 +181,15 @@ def finish(source, public, run, recipient):
     candidate, _ = load_snapshot(source, node_id, kind, slot, run["head_sha"], recipient)
     previous = latest_statuses(source, candidate.source_sha).get("ci/public-" + kind)
     matched = STATUS_KEY.fullmatch((previous or {}).get("description", ""))
-    if (not matched or matched[1] != key or matched[2] != candidate.control_sha
+    if not matched:
+        try:
+            alias, alias_key = load_snapshot(source, (previous or {})["node_id"], kind, slot,
+                                             run["head_sha"], recipient, allow_draft=True)
+        except (KeyError, ValueError):
+            return "superseded"
+        if alias_key is not None or alias != candidate:
+            return "superseded"
+    elif (matched[1] != key or matched[2] != candidate.control_sha
             or (previous.get("creator") or {}).get("login", "").casefold()
             != source.repository.split("/")[0].casefold()
             or run_id_from_url(previous.get("target_url"), public.repository) != run["id"]):
@@ -214,8 +222,8 @@ def dispatch_request(source, public, candidate, kind, pipeline_sha, recipient, f
                     raise
                 run = None
             if run and trusted_run(run, public.repository, pipeline_sha, key, kind):
-                publish(source, candidate, kind, key, "queued", "pending", run["html_url"], None)
                 if run["status"] != "completed":
+                    publish(source, candidate, kind, key, "queued", "pending", run["html_url"], None)
                     return "active"
                 if not force:
                     return finish(source, public, run, recipient)
